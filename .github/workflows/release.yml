@@ -12,257 +12,100 @@ on:
     inputs:
       tag_name:
         description: Tag to publish (e.g. v1.2.3)
-        required: false
-        type: string
-      commit_sha:
-        description: Commit SHA to attach the release to (defaults to tag commit)
-        required: false
+        required: true
         type: string
 
 jobs:
-  prepare:
-    name: Prepare Metadata
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.vars.outputs.tag }}
-      version: ${{ steps.vars.outputs.version }}
-      commit: ${{ steps.vars.outputs.commit }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Collect release inputs
-        id: vars
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PUSH_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            TAG="$(jq -r '.inputs.tag_name // ""' "$GITHUB_EVENT_PATH")"
-            if [ -z "$TAG" ]; then
-              echo "tag_name input is required for manual releases." >&2
-              exit 1
-            fi
-            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
-            COMMIT="$(jq -r '.inputs.commit_sha // ""' "$GITHUB_EVENT_PATH")"
-            if [ -z "$COMMIT" ]; then
-              COMMIT="$(git rev-list -n 1 "$TAG")"
-            fi
-          else
-            TAG="$PUSH_TAG"
-            if [ -z "$TAG" ]; then
-              echo "Unable to determine tag for push event; aborting release." >&2
-              exit 1
-            fi
-            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
-            COMMIT="$(git rev-list -n 1 "$TAG")"
-          fi
-
-          if [ -z "$COMMIT" ]; then
-            echo "Unable to resolve commit for tag '$TAG'." >&2
-            exit 1
-          fi
-
-          if [[ "$TAG" != v* ]]; then
-            echo "Tag '$TAG' does not follow v*.*.* pattern; aborting release." >&2
-            exit 1
-          fi
-
-          VERSION="${TAG#v}"
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
-
-      - name: Verify Cargo.toml version matches tag
-        env:
-          VERSION: ${{ steps.vars.outputs.version }}
-        run: |
-          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [ "$CARGO_VERSION" != "$VERSION" ]; then
-            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tag ($VERSION)"
-            exit 1
-          fi
-          echo "Version verified: $CARGO_VERSION"
-
-  ci:
-    name: Run CI Checks
-    needs: prepare
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      checks: write
-    secrets: inherit
-
-  artifacts:
-    name: Build Release Artifacts
-    needs: [prepare, ci]
-    if: needs.prepare.outputs.tag != ''
-    uses: ./.github/workflows/build-artifacts.yml
-    with:
-      ref: ${{ needs.prepare.outputs.commit }}
-    secrets: inherit
-
-  docker:
-    name: Publish Docker Image
-    needs:
-      - prepare
-      - artifacts
-    if: needs.prepare.outputs.tag != ''
-    runs-on: ubuntu-latest
+  build-and-push:
+    name: Build & Push (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - name: Download pre-built images
-        uses: actions/download-artifact@v7
+      - uses: actions/checkout@v6
         with:
-          pattern: otlp2parquet-image-*
-          path: images
-          merge-multiple: true
+          ref: ${{ inputs.tag_name || github.ref }}
+
+      - name: Configure toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          targets: ${{ matrix.target }}
+          cache-prefix: release
+          cache-key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --bin otlp2parquet
+
+      - name: Prepare dist
+        run: |
+          mkdir -p dist/linux-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/otlp2parquet dist/linux-${{ matrix.arch }}/otlp2parquet
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Load and push images
-        id: push
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          # Load both platform images
-          docker load -i images/otlp2parquet-amd64.tar
-          docker load -i images/otlp2parquet-arm64.tar
-
-          # Tag and push each platform
-          AMD64_DIGEST=$(docker image inspect otlp2parquet:amd64 -f '{{.Id}}')
-          ARM64_DIGEST=$(docker image inspect otlp2parquet:arm64 -f '{{.Id}}')
-
-          # Generate all tags
-          TAGS=(
-            "${REGISTRY}/${IMAGE_NAME}:latest"
-            "${REGISTRY}/${IMAGE_NAME}:${TAG}"
-            "${REGISTRY}/${IMAGE_NAME}:${VERSION}"
-          )
-
-          # Tag and push amd64
-          for tag in "${TAGS[@]}"; do
-            docker tag otlp2parquet:amd64 "${tag}-amd64"
-            docker push "${tag}-amd64"
-          done
-
-          # Tag and push arm64
-          for tag in "${TAGS[@]}"; do
-            docker tag otlp2parquet:arm64 "${tag}-arm64"
-            docker push "${tag}-arm64"
-          done
-
-          # Create and push manifest lists for all tags
-          for tag in "${TAGS[@]}"; do
-            docker buildx imagetools create -t "${tag}" \
-              "${tag}-amd64" \
-              "${tag}-arm64"
-          done
-
-          # Output the manifest digest for latest tag
-          MANIFEST_DIGEST=$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:latest" --format '{{json .Manifest}}' | jq -r '.digest')
-          echo "digest=${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
-
-      - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v3
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
+          context: .
+          platforms: ${{ matrix.platform }}
+          target: runtime-prebuilt
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.arch }}
 
-  publish:
-    name: Publish GitHub Release
-    needs:
-      - prepare
-      - artifacts
-      - docker
-    if: needs.prepare.outputs.tag != ''
+  manifest:
+    name: Create Multi-Arch Manifest
+    needs: build-and-push
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.commit }}
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: otlp2parquet-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Create checksums
+      - name: Resolve tag
+        id: tag
         run: |
-          cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec sha256sum {} \; > ../checksums.txt
-          cd ..
+          TAG="${{ inputs.tag_name || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub release
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.tag }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            artifacts/*.tar.gz \
-            checksums.txt
-
-  crates-publish:
-    name: Publish to crates.io
-    needs:
-      - prepare
-      - publish
-    if: needs.prepare.outputs.tag != ''
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.commit }}
-
-      - name: Configure toolchain
-        uses: ./.github/actions/setup-rust
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p otlp2parquet
-
-  docs:
-    name: Deploy Documentation
-    needs:
-      - prepare
-      - publish
-    if: needs.prepare.outputs.tag != ''
-    uses: ./.github/workflows/docs.yml
-    with:
-      version: ${{ needs.prepare.outputs.tag }}
-      ref: ${{ needs.prepare.outputs.commit }}
-    permissions:
-      contents: write
-      pages: write
-      id-token: write
+          for t in latest "$TAG" "$VERSION"; do
+            docker buildx imagetools create -t "$IMAGE:$t" \
+              "$IMAGE:amd64" \
+              "$IMAGE:arm64"
+          done
