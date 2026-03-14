@@ -431,22 +431,20 @@ pub(crate) async fn persist_log_batch(
     completed: &CompletedBatch,
     severity_enabled: bool,
 ) -> Result<Vec<String>, anyhow::Error> {
-    let non_empty: Vec<&arrow::array::RecordBatch> = completed
-        .batches
-        .iter()
-        .filter(|b| b.num_rows() > 0)
-        .collect();
+    let merged = merge_record_batches(&completed.batches)?;
 
-    if non_empty.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let merged = if non_empty.len() == 1 {
-        non_empty[0].clone()
-    } else {
-        let schema = non_empty[0].schema();
-        arrow::compute::concat_batches(&schema, non_empty.into_iter())
-            .map_err(|e| anyhow::anyhow!("Failed to merge batches before write: {}", e))?
+    let merged = match merged {
+        Some(batch) => batch,
+        None => {
+            if completed.metadata.record_count > 0 {
+                tracing::error!(
+                    service = %completed.metadata.service_name,
+                    expected_rows = completed.metadata.record_count,
+                    "CompletedBatch metadata reports rows but all batches are empty — data loss"
+                );
+            }
+            return Ok(Vec::new());
+        }
     };
 
     let written = write_batch_with_severity(
@@ -462,6 +460,25 @@ pub(crate) async fn persist_log_batch(
     counter!("otlp.batch.flushes").increment(written.len() as u64);
 
     Ok(written)
+}
+
+/// Merge multiple RecordBatches into one, filtering out empty batches.
+/// Returns None if all batches are empty.
+pub(crate) fn merge_record_batches(
+    batches: &[arrow::array::RecordBatch],
+) -> anyhow::Result<Option<arrow::array::RecordBatch>> {
+    let non_empty: Vec<&arrow::array::RecordBatch> =
+        batches.iter().filter(|b| b.num_rows() > 0).collect();
+
+    if non_empty.is_empty() {
+        return Ok(None);
+    }
+
+    let schema = non_empty[0].schema();
+    let merged = arrow::compute::concat_batches(&schema, non_empty.into_iter())
+        .map_err(|e| anyhow::anyhow!("Failed to merge batches: {}", e))?;
+
+    Ok(Some(merged))
 }
 
 /// Write a batch (or severity-split sub-batches) to storage.
@@ -582,4 +599,109 @@ async fn write_grouped_batches(
     }
 
     Ok((paths, total_records))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn make_batch(rows: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("severity_text", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let sev = StringArray::from(rows.iter().map(|s| Some(*s)).collect::<Vec<_>>());
+        let body = StringArray::from(rows.iter().map(|_| Some("msg")).collect::<Vec<_>>());
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(sev) as ArrayRef, Arc::new(body) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    fn empty_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("severity_text", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        RecordBatch::new_empty(schema)
+    }
+
+    #[test]
+    fn test_merge_multiple_batches_preserves_all_rows() {
+        let b1 = make_batch(&["INFO", "ERROR"]);
+        let b2 = make_batch(&["WARN"]);
+        let b3 = make_batch(&["DEBUG", "INFO", "FATAL"]);
+
+        let merged = merge_record_batches(&[b1, b2, b3]).unwrap().unwrap();
+        assert_eq!(merged.num_rows(), 6);
+
+        let sev_col = merged
+            .column_by_name("severity_text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(sev_col.value(0), "INFO");
+        assert_eq!(sev_col.value(1), "ERROR");
+        assert_eq!(sev_col.value(2), "WARN");
+        assert_eq!(sev_col.value(3), "DEBUG");
+        assert_eq!(sev_col.value(4), "INFO");
+        assert_eq!(sev_col.value(5), "FATAL");
+    }
+
+    #[test]
+    fn test_merge_all_empty_returns_none() {
+        let result = merge_record_batches(&[empty_batch(), empty_batch()]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_merge_no_batches_returns_none() {
+        let result = merge_record_batches(&[]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_merge_mixed_empty_and_nonempty() {
+        let b1 = empty_batch();
+        let b2 = make_batch(&["ERROR", "WARN"]);
+        let b3 = empty_batch();
+        let b4 = make_batch(&["INFO"]);
+
+        let merged = merge_record_batches(&[b1, b2, b3, b4]).unwrap().unwrap();
+        assert_eq!(merged.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_merge_single_batch() {
+        let b = make_batch(&["INFO", "ERROR"]);
+        let merged = merge_record_batches(std::slice::from_ref(&b))
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_merge_schema_mismatch_errors() {
+        let schema_a = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+
+        let b1 = RecordBatch::try_new(
+            schema_a,
+            vec![Arc::new(StringArray::from(vec!["x"])) as ArrayRef],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema_b,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+
+        let result = merge_record_batches(&[b1, b2]);
+        assert!(result.is_err());
+    }
 }
