@@ -15,7 +15,12 @@ pub fn initialize_storage(config: &RuntimeConfig) -> Result<()> {
         return Ok(());
     }
 
-    let _ = PARTITION_LOGS_BY_SEVERITY.set(config.storage.partition_logs_by_severity);
+    if PARTITION_LOGS_BY_SEVERITY
+        .set(config.storage.partition_logs_by_severity)
+        .is_err()
+    {
+        tracing::debug!("Severity partitioning flag already initialized");
+    }
 
     let operator = match config.storage.backend {
         StorageBackend::Fs => {

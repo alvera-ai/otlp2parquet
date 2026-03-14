@@ -2,6 +2,7 @@
 //!
 //! Writes OTLP Arrow RecordBatch data to partitioned Parquet files using OpenDAL.
 
+use crate::types::SeverityPartition;
 use crate::SignalType;
 use arrow::array::RecordBatch;
 use otlp2records::output::to_parquet_bytes;
@@ -23,8 +24,8 @@ pub struct WriteBatchRequest<'a> {
     pub service_name: &'a str,
     /// Timestamp in microseconds (from OTLP-to-Arrow nanos_to_micros conversion)
     pub timestamp_micros: i64,
-    /// Severity partition value (lowercased). Only used when severity partitioning is enabled.
-    pub severity: Option<&'a str>,
+    /// Severity partition. Only used when severity partitioning is enabled for logs.
+    pub severity: Option<SeverityPartition>,
 }
 
 /// Write a batch as a Parquet file.
@@ -33,7 +34,7 @@ async fn write_plain_parquet(
     metric_type: Option<&str>,
     service_name: &str,
     timestamp_micros: i64,
-    severity: Option<&str>,
+    severity: Option<SeverityPartition>,
     batch: &RecordBatch,
 ) -> Result<String> {
     let op = super::storage::get_operator().ok_or_else(|| {
@@ -99,7 +100,7 @@ fn generate_parquet_path(
     metric_type: Option<&str>,
     service_name: &str,
     timestamp_micros: i64,
-    severity: Option<&str>,
+    severity: Option<SeverityPartition>,
 ) -> Result<String> {
     let (year, month, day, hour) = partition_from_timestamp(timestamp_micros);
 
@@ -121,8 +122,8 @@ fn generate_parquet_path(
     let storage_prefix = super::storage::get_storage_prefix().unwrap_or("");
 
     let severity_segment = match severity {
-        Some(s) if !s.is_empty() => format!("severity={}/", s),
-        _ => String::new(),
+        Some(sev) => format!("severity={}/", sev.as_str()),
+        None => String::new(),
     };
 
     Ok(format!(
@@ -266,7 +267,7 @@ mod tests {
             None,
             "my-svc",
             1_736_938_800_000_000,
-            Some("error"),
+            Some(SeverityPartition::Error),
         )
         .unwrap();
         assert!(path.starts_with("logs/my-svc/severity=error/year="));
