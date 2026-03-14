@@ -53,6 +53,11 @@ pub fn apply_env_overrides<E: EnvSource>(config: &mut RuntimeConfig, env: &E) ->
         config.request.max_payload_bytes = val;
     }
 
+    // Severity partitioning
+    if let Some(val) = get_env_bool(env, "PARTITION_LOGS_BY_SEVERITY")? {
+        config.storage.partition_logs_by_severity = val;
+    }
+
     // Storage backend
     if let Some(backend) = get_env_string(env, "STORAGE_BACKEND")? {
         config.storage.backend = backend

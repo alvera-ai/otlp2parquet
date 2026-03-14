@@ -2,6 +2,7 @@
 //!
 //! Writes OTLP Arrow RecordBatch data to partitioned Parquet files using OpenDAL.
 
+use crate::types::SeverityPartition;
 use crate::SignalType;
 use arrow::array::RecordBatch;
 use otlp2records::output::to_parquet_bytes;
@@ -23,6 +24,8 @@ pub struct WriteBatchRequest<'a> {
     pub service_name: &'a str,
     /// Timestamp in microseconds (from OTLP-to-Arrow nanos_to_micros conversion)
     pub timestamp_micros: i64,
+    /// Severity partition. Only used when severity partitioning is enabled for logs.
+    pub severity: Option<SeverityPartition>,
 }
 
 /// Write a batch as a Parquet file.
@@ -31,6 +34,7 @@ async fn write_plain_parquet(
     metric_type: Option<&str>,
     service_name: &str,
     timestamp_micros: i64,
+    severity: Option<SeverityPartition>,
     batch: &RecordBatch,
 ) -> Result<String> {
     let op = super::storage::get_operator().ok_or_else(|| {
@@ -40,8 +44,13 @@ async fn write_plain_parquet(
         )
     })?;
 
-    let file_path =
-        generate_parquet_path(signal_type, metric_type, service_name, timestamp_micros)?;
+    let file_path = generate_parquet_path(
+        signal_type,
+        metric_type,
+        service_name,
+        timestamp_micros,
+        severity,
+    )?;
 
     tracing::debug!("Writing plain Parquet to path: {}", file_path);
 
@@ -84,6 +93,7 @@ pub async fn write_batch(req: WriteBatchRequest<'_>) -> Result<String> {
         req.metric_type,
         req.service_name,
         req.timestamp_micros,
+        req.severity,
         req.batch,
     )
     .await
@@ -95,6 +105,7 @@ fn generate_parquet_path(
     metric_type: Option<&str>,
     service_name: &str,
     timestamp_micros: i64,
+    severity: Option<SeverityPartition>,
 ) -> Result<String> {
     let (year, month, day, hour) = partition_from_timestamp(timestamp_micros);
 
@@ -115,11 +126,17 @@ fn generate_parquet_path(
 
     let storage_prefix = super::storage::get_storage_prefix().unwrap_or("");
 
+    let severity_segment = match severity {
+        Some(sev) => format!("severity={}/", sev.as_str()),
+        None => String::new(),
+    };
+
     Ok(format!(
-        "{}{}/{}/year={}/month={:02}/day={:02}/hour={:02}/{}-{}.parquet",
+        "{}{}/{}/{}year={}/month={:02}/day={:02}/hour={:02}/{}-{}.parquet",
         storage_prefix,
         signal_prefix,
         safe_service,
+        severity_segment,
         year,
         month,
         day,
@@ -240,12 +257,46 @@ mod tests {
 
     #[test]
     fn path_generation_sanitizes_service() {
-        let path =
-            generate_parquet_path(SignalType::Logs, None, "svc /name", 1_736_938_800_000_000)
-                .unwrap();
+        let path = generate_parquet_path(
+            SignalType::Logs,
+            None,
+            "svc /name",
+            1_736_938_800_000_000,
+            None,
+        )
+        .unwrap();
         assert!(path.starts_with("logs/svc__name/year="));
         assert!(path.contains("/month="));
         assert!(path.ends_with(".parquet"));
         assert!(path.split('-').next_back().unwrap().ends_with(".parquet"));
+    }
+
+    #[test]
+    fn path_generation_with_severity() {
+        let path = generate_parquet_path(
+            SignalType::Logs,
+            None,
+            "my-svc",
+            1_736_938_800_000_000,
+            Some(SeverityPartition::Error),
+        )
+        .unwrap();
+        assert!(path.starts_with("logs/my-svc/severity=error/year="));
+        assert!(path.contains("/month="));
+        assert!(path.ends_with(".parquet"));
+    }
+
+    #[test]
+    fn path_generation_without_severity() {
+        let path = generate_parquet_path(
+            SignalType::Logs,
+            None,
+            "my-svc",
+            1_736_938_800_000_000,
+            None,
+        )
+        .unwrap();
+        assert!(path.starts_with("logs/my-svc/year="));
+        assert!(!path.contains("severity="));
     }
 }

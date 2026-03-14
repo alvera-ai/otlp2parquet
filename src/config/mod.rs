@@ -88,6 +88,11 @@ pub struct StorageConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2: Option<R2Config>,
+
+    /// Partition log files by severity level in the output path.
+    /// Adds `severity={level}` to the Hive-style partition path.
+    #[serde(default)]
+    pub partition_logs_by_severity: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +292,7 @@ fn platform_defaults(platform: Platform) -> RuntimeConfig {
             fs: Some(FsConfig::default()),
             s3: None,
             r2: None,
+            partition_logs_by_severity: false,
         },
         StorageBackend::S3 => StorageConfig {
             backend: StorageBackend::S3,
@@ -298,6 +304,7 @@ fn platform_defaults(platform: Platform) -> RuntimeConfig {
                 prefix: None,
             }),
             r2: None,
+            partition_logs_by_severity: false,
         },
         StorageBackend::R2 => StorageConfig {
             backend: StorageBackend::R2,
@@ -311,6 +318,7 @@ fn platform_defaults(platform: Platform) -> RuntimeConfig {
                 endpoint: None,
                 prefix: None,
             }),
+            partition_logs_by_severity: false,
         },
     };
 
@@ -354,5 +362,55 @@ mod tests {
         let server = ServerConfig::default();
         assert_eq!(server.listen_addr, "0.0.0.0:4318");
         assert_eq!(server.log_format, LogFormat::Text);
+    }
+
+    #[test]
+    fn test_toml_severity_partitioning_default_false() {
+        let toml = r#"
+            [storage]
+            backend = "fs"
+            [storage.fs]
+            path = "./data"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml).unwrap();
+        assert!(!config.storage.partition_logs_by_severity);
+    }
+
+    #[test]
+    fn test_toml_severity_partitioning_enabled() {
+        let toml = r#"
+            [storage]
+            backend = "fs"
+            partition_logs_by_severity = true
+            [storage.fs]
+            path = "./data"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml).unwrap();
+        assert!(config.storage.partition_logs_by_severity);
+    }
+
+    #[test]
+    fn test_env_override_severity_partitioning() {
+        use std::collections::HashMap;
+
+        struct TestEnv(HashMap<String, String>);
+        impl env_overrides::EnvSource for TestEnv {
+            fn get(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn get_raw(&self, _key: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let mut env = HashMap::new();
+        env.insert("PARTITION_LOGS_BY_SEVERITY".to_string(), "true".to_string());
+        let test_env = TestEnv(env);
+
+        let mut config = RuntimeConfig::from_platform_defaults(Platform::detect());
+        assert!(!config.storage.partition_logs_by_severity);
+
+        env_overrides::apply_env_overrides(&mut config, &test_env).unwrap();
+        assert!(config.storage.partition_logs_by_severity);
     }
 }
