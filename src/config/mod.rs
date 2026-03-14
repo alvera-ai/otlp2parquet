@@ -88,6 +88,11 @@ pub struct StorageConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2: Option<R2Config>,
+
+    /// Partition log files by severity level in the output path.
+    /// Adds `severity={level}` to the Hive-style partition path.
+    #[serde(default)]
+    pub partition_logs_by_severity: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +292,7 @@ fn platform_defaults(platform: Platform) -> RuntimeConfig {
             fs: Some(FsConfig::default()),
             s3: None,
             r2: None,
+            partition_logs_by_severity: false,
         },
         StorageBackend::S3 => StorageConfig {
             backend: StorageBackend::S3,
@@ -298,6 +304,7 @@ fn platform_defaults(platform: Platform) -> RuntimeConfig {
                 prefix: None,
             }),
             r2: None,
+            partition_logs_by_severity: false,
         },
         StorageBackend::R2 => StorageConfig {
             backend: StorageBackend::R2,
@@ -311,6 +318,7 @@ fn platform_defaults(platform: Platform) -> RuntimeConfig {
                 endpoint: None,
                 prefix: None,
             }),
+            partition_logs_by_severity: false,
         },
     };
 

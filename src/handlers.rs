@@ -422,23 +422,42 @@ pub(crate) async fn persist_log_batch(
     completed: &CompletedBatch,
 ) -> Result<Vec<String>, anyhow::Error> {
     let mut paths = Vec::new();
+    let severity_enabled = crate::writer::partition_logs_by_severity();
 
     for batch in &completed.batches {
         if batch.num_rows() == 0 {
             continue;
         }
 
-        let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
-            batch,
-            signal_type: SignalType::Logs,
-            metric_type: None,
-            service_name: &completed.metadata.service_name,
-            timestamp_micros: completed.metadata.first_timestamp_micros,
-        })
-        .await?;
+        if severity_enabled {
+            for (severity, sub_batch) in crate::codec::split_batch_by_severity(batch) {
+                let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
+                    batch: &sub_batch,
+                    signal_type: SignalType::Logs,
+                    metric_type: None,
+                    service_name: &completed.metadata.service_name,
+                    timestamp_micros: completed.metadata.first_timestamp_micros,
+                    severity: Some(&severity),
+                })
+                .await?;
 
-        counter!("otlp.batch.flushes").increment(1);
-        paths.push(path);
+                counter!("otlp.batch.flushes").increment(1);
+                paths.push(path);
+            }
+        } else {
+            let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
+                batch,
+                signal_type: SignalType::Logs,
+                metric_type: None,
+                service_name: &completed.metadata.service_name,
+                timestamp_micros: completed.metadata.first_timestamp_micros,
+                severity: None,
+            })
+            .await?;
+
+            counter!("otlp.batch.flushes").increment(1);
+            paths.push(path);
+        }
     }
 
     Ok(paths)
@@ -459,6 +478,8 @@ async fn write_grouped_batches(
 ) -> Result<(Vec<String>, usize), AppError> {
     let mut paths = Vec::new();
     let mut total_records = 0usize;
+    let severity_enabled =
+        matches!(mode, BatchWriteMode::Logs) && crate::writer::partition_logs_by_severity();
 
     for pb in grouped.batches {
         if pb.batch.num_rows() == 0 {
@@ -477,44 +498,82 @@ async fn write_grouped_batches(
             BatchWriteMode::Metrics { .. } => {}
         }
 
-        let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
-            batch: &pb.batch,
-            signal_type,
-            metric_type,
-            service_name: &pb.service_name,
-            timestamp_micros: pb.min_timestamp_micros,
-        })
-        .await
-        .map_err(|e| {
-            AppError::internal(anyhow::anyhow!("Failed to write {}: {}", error_context, e))
-        })?;
+        if severity_enabled {
+            for (severity, sub_batch) in crate::codec::split_batch_by_severity(&pb.batch) {
+                let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
+                    batch: &sub_batch,
+                    signal_type,
+                    metric_type,
+                    service_name: &pb.service_name,
+                    timestamp_micros: pb.min_timestamp_micros,
+                    severity: Some(&severity),
+                })
+                .await
+                .map_err(|e| {
+                    AppError::internal(anyhow::anyhow!(
+                        "Failed to write {}: {}",
+                        error_context,
+                        e
+                    ))
+                })?;
 
-        match mode {
-            BatchWriteMode::Logs => {
                 counter!("otlp.batch.flushes").increment(1);
-                histogram!("otlp.batch.rows").record(pb.record_count as f64);
+                histogram!("otlp.batch.rows").record(sub_batch.num_rows() as f64);
                 info!(
-                    "Committed batch path={} service={} rows={}",
-                    path, pb.service_name, pb.record_count
+                    "Committed batch path={} service={} severity={} rows={}",
+                    path,
+                    pb.service_name,
+                    severity,
+                    sub_batch.num_rows()
                 );
+                paths.push(path);
             }
-            BatchWriteMode::Traces => {
-                counter!("otlp.traces.flushes").increment(1);
-                histogram!("otlp.batch.rows", "signal" => "traces").record(pb.record_count as f64);
-                info!(
-                    "Committed traces batch path={} service={} spans={}",
-                    path, pb.service_name, pb.record_count
-                );
+        } else {
+            let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
+                batch: &pb.batch,
+                signal_type,
+                metric_type,
+                service_name: &pb.service_name,
+                timestamp_micros: pb.min_timestamp_micros,
+                severity: None,
+            })
+            .await
+            .map_err(|e| {
+                AppError::internal(anyhow::anyhow!(
+                    "Failed to write {}: {}",
+                    error_context,
+                    e
+                ))
+            })?;
+
+            match mode {
+                BatchWriteMode::Logs => {
+                    counter!("otlp.batch.flushes").increment(1);
+                    histogram!("otlp.batch.rows").record(pb.record_count as f64);
+                    info!(
+                        "Committed batch path={} service={} rows={}",
+                        path, pb.service_name, pb.record_count
+                    );
+                }
+                BatchWriteMode::Traces => {
+                    counter!("otlp.traces.flushes").increment(1);
+                    histogram!("otlp.batch.rows", "signal" => "traces")
+                        .record(pb.record_count as f64);
+                    info!(
+                        "Committed traces batch path={} service={} spans={}",
+                        path, pb.service_name, pb.record_count
+                    );
+                }
+                BatchWriteMode::Metrics { metric_type } => {
+                    counter!("otlp.metrics.flushes", "metric_type" => metric_type).increment(1);
+                    info!(
+                        "Committed metrics batch path={} metric_type={} service={} points={}",
+                        path, metric_type, pb.service_name, pb.record_count
+                    );
+                }
             }
-            BatchWriteMode::Metrics { metric_type } => {
-                counter!("otlp.metrics.flushes", "metric_type" => metric_type).increment(1);
-                info!(
-                    "Committed metrics batch path={} metric_type={} service={} points={}",
-                    path, metric_type, pb.service_name, pb.record_count
-                );
-            }
+            paths.push(path);
         }
-        paths.push(path);
     }
 
     Ok((paths, total_records))

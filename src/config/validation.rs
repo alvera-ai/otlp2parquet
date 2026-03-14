@@ -223,6 +223,7 @@ mod tests {
                 prefix: None,
             }),
             r2: None,
+            partition_logs_by_severity: false,
         };
         assert!(validate_storage_config(&s3_config).is_ok());
 
@@ -237,6 +238,7 @@ mod tests {
                 prefix: None,
             }),
             r2: None,
+            partition_logs_by_severity: false,
         };
         assert!(validate_storage_config(&invalid_s3).is_err());
     }

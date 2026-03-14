@@ -7,12 +7,15 @@ use super::error::{Result, WriterError};
 
 static OPERATOR: OnceCell<opendal::Operator> = OnceCell::new();
 static STORAGE_PREFIX: OnceCell<Option<String>> = OnceCell::new();
+static PARTITION_LOGS_BY_SEVERITY: OnceCell<bool> = OnceCell::new();
 
 /// Initialize storage operator from RuntimeConfig.
 pub fn initialize_storage(config: &RuntimeConfig) -> Result<()> {
     if OPERATOR.get().is_some() {
         return Ok(());
     }
+
+    let _ = PARTITION_LOGS_BY_SEVERITY.set(config.storage.partition_logs_by_severity);
 
     let operator = match config.storage.backend {
         StorageBackend::Fs => {
@@ -101,4 +104,9 @@ pub(crate) fn get_storage_prefix() -> Option<&'static str> {
         .get()
         .and_then(|opt| opt.as_ref())
         .map(|s| s.as_str())
+}
+
+/// Whether log files should be partitioned by severity level.
+pub fn partition_logs_by_severity() -> bool {
+    PARTITION_LOGS_BY_SEVERITY.get().copied().unwrap_or(false)
 }
