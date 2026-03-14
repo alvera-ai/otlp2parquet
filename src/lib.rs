@@ -285,11 +285,11 @@ async fn flush_pending_batches(state: &AppState) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    warn!(
+                    error!(
                         error = %e,
                         service_name = %service,
                         rows,
-                        "Failed to flush pending batch during shutdown"
+                        "Failed to flush pending batch during shutdown — data lost"
                     );
                 }
             }
@@ -336,11 +336,11 @@ async fn run_background_flush(state: AppState, shutdown: Arc<AtomicBool>, interv
                                 }
                             }
                             Err(e) => {
-                                warn!(
+                                error!(
                                     error = %e,
                                     service_name = %service,
                                     rows,
-                                    "Failed to flush expired batch"
+                                    "Failed to flush expired batch — data lost"
                                 );
                             }
                         }
