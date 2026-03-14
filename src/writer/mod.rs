@@ -9,5 +9,5 @@ mod error;
 mod storage;
 mod write;
 
-pub use storage::{initialize_storage, partition_logs_by_severity};
+pub use storage::initialize_storage;
 pub use write::{write_batch, WriteBatchRequest};

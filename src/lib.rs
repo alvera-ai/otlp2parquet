@@ -58,6 +58,7 @@ use init::init_writer;
 pub(crate) struct AppState {
     pub batcher: Option<Arc<BatchManager>>,
     pub max_payload_bytes: usize,
+    pub partition_logs_by_severity: bool,
 }
 
 /// Error type that implements IntoResponse
@@ -191,6 +192,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     let state = AppState {
         batcher,
         max_payload_bytes,
+        partition_logs_by_severity: config.storage.partition_logs_by_severity,
     };
 
     let router_state = state.clone();
@@ -271,7 +273,7 @@ async fn flush_pending_batches(state: &AppState) -> Result<()> {
         for completed in pending {
             let rows = completed.metadata.record_count;
             let service = completed.metadata.service_name.as_ref().to_string();
-            match handlers::persist_log_batch(&completed).await {
+            match handlers::persist_log_batch(&completed, state.partition_logs_by_severity).await {
                 Ok(paths) => {
                     for path in paths {
                         info!(
@@ -317,7 +319,12 @@ async fn run_background_flush(state: AppState, shutdown: Arc<AtomicBool>, interv
                     for completed in expired {
                         let rows = completed.metadata.record_count;
                         let service = completed.metadata.service_name.as_ref().to_string();
-                        match handlers::persist_log_batch(&completed).await {
+                        match handlers::persist_log_batch(
+                            &completed,
+                            state.partition_logs_by_severity,
+                        )
+                        .await
+                        {
                             Ok(paths) => {
                                 for path in &paths {
                                     info!(

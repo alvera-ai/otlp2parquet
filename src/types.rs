@@ -185,6 +185,9 @@ pub enum SeverityPartition {
 }
 
 impl SeverityPartition {
+    /// Number of distinct severity partition variants.
+    pub const VARIANT_COUNT: usize = 7;
+
     /// The lowercased partition key used in file paths.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -204,18 +207,36 @@ impl SeverityPartition {
         if text.is_empty() {
             return Self::Unspecified;
         }
-        // Check prefix length then case-insensitive match
-        if text.len() >= 5 && text[..5].eq_ignore_ascii_case("trace") {
+        // str::get avoids panics on multi-byte UTF-8 char boundaries
+        if text
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("trace"))
+        {
             Self::Trace
-        } else if text.len() >= 5 && text[..5].eq_ignore_ascii_case("debug") {
+        } else if text
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("debug"))
+        {
             Self::Debug
-        } else if text.len() >= 4 && text[..4].eq_ignore_ascii_case("info") {
+        } else if text
+            .get(..4)
+            .is_some_and(|s| s.eq_ignore_ascii_case("info"))
+        {
             Self::Info
-        } else if text.len() >= 4 && text[..4].eq_ignore_ascii_case("warn") {
+        } else if text
+            .get(..4)
+            .is_some_and(|s| s.eq_ignore_ascii_case("warn"))
+        {
             Self::Warn
-        } else if text.len() >= 5 && text[..5].eq_ignore_ascii_case("error") {
+        } else if text
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("error"))
+        {
             Self::Error
-        } else if text.len() >= 5 && text[..5].eq_ignore_ascii_case("fatal") {
+        } else if text
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("fatal"))
+        {
             Self::Fatal
         } else {
             Self::Unspecified
@@ -330,37 +351,115 @@ mod tests {
 
     #[test]
     fn test_severity_partition_standard_values() {
-        assert_eq!(SeverityPartition::from_severity_text("TRACE"), SeverityPartition::Trace);
-        assert_eq!(SeverityPartition::from_severity_text("DEBUG"), SeverityPartition::Debug);
-        assert_eq!(SeverityPartition::from_severity_text("INFO"), SeverityPartition::Info);
-        assert_eq!(SeverityPartition::from_severity_text("WARN"), SeverityPartition::Warn);
-        assert_eq!(SeverityPartition::from_severity_text("ERROR"), SeverityPartition::Error);
-        assert_eq!(SeverityPartition::from_severity_text("FATAL"), SeverityPartition::Fatal);
+        assert_eq!(
+            SeverityPartition::from_severity_text("TRACE"),
+            SeverityPartition::Trace
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("DEBUG"),
+            SeverityPartition::Debug
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("INFO"),
+            SeverityPartition::Info
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("WARN"),
+            SeverityPartition::Warn
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("ERROR"),
+            SeverityPartition::Error
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("FATAL"),
+            SeverityPartition::Fatal
+        );
     }
 
     #[test]
     fn test_severity_partition_sub_levels() {
-        assert_eq!(SeverityPartition::from_severity_text("DEBUG2"), SeverityPartition::Debug);
-        assert_eq!(SeverityPartition::from_severity_text("INFO3"), SeverityPartition::Info);
-        assert_eq!(SeverityPartition::from_severity_text("TRACE4"), SeverityPartition::Trace);
-        assert_eq!(SeverityPartition::from_severity_text("ERROR2"), SeverityPartition::Error);
+        assert_eq!(
+            SeverityPartition::from_severity_text("DEBUG2"),
+            SeverityPartition::Debug
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("INFO3"),
+            SeverityPartition::Info
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("TRACE4"),
+            SeverityPartition::Trace
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("ERROR2"),
+            SeverityPartition::Error
+        );
     }
 
     #[test]
     fn test_severity_partition_case_insensitive() {
-        assert_eq!(SeverityPartition::from_severity_text("info"), SeverityPartition::Info);
-        assert_eq!(SeverityPartition::from_severity_text("Error"), SeverityPartition::Error);
-        assert_eq!(SeverityPartition::from_severity_text("dEbUg"), SeverityPartition::Debug);
+        assert_eq!(
+            SeverityPartition::from_severity_text("info"),
+            SeverityPartition::Info
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("Error"),
+            SeverityPartition::Error
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("dEbUg"),
+            SeverityPartition::Debug
+        );
     }
 
     #[test]
     fn test_severity_partition_empty_and_unknown() {
-        assert_eq!(SeverityPartition::from_severity_text(""), SeverityPartition::Unspecified);
+        assert_eq!(
+            SeverityPartition::from_severity_text(""),
+            SeverityPartition::Unspecified
+        );
         // "INFORMATION" starts with "INFO" — prefix match maps to Info
-        assert_eq!(SeverityPartition::from_severity_text("INFORMATION"), SeverityPartition::Info);
-        assert_eq!(SeverityPartition::from_severity_text("ERR"), SeverityPartition::Unspecified);
-        assert_eq!(SeverityPartition::from_severity_text("OK"), SeverityPartition::Unspecified);
-        assert_eq!(SeverityPartition::from_severity_text("FOO"), SeverityPartition::Unspecified);
+        assert_eq!(
+            SeverityPartition::from_severity_text("INFORMATION"),
+            SeverityPartition::Info
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("ERR"),
+            SeverityPartition::Unspecified
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("OK"),
+            SeverityPartition::Unspecified
+        );
+        assert_eq!(
+            SeverityPartition::from_severity_text("FOO"),
+            SeverityPartition::Unspecified
+        );
+    }
+
+    #[test]
+    fn test_severity_partition_non_ascii_no_panic() {
+        // "abcdé": byte 5 splits a 2-byte char — must not panic
+        assert_eq!(
+            SeverityPartition::from_severity_text("abcdé"),
+            SeverityPartition::Unspecified
+        );
+        // 4-byte emoji at position 4
+        assert_eq!(
+            SeverityPartition::from_severity_text("abc\u{1F525}"),
+            SeverityPartition::Unspecified
+        );
+        // Multi-byte after valid prefix: "INFO" + 2-byte char
+        assert_eq!(
+            SeverityPartition::from_severity_text("INFOé"),
+            SeverityPartition::Info
+        );
+        // "TRAC" + 2-byte char — byte 5 is not a char boundary
+        assert_eq!(
+            SeverityPartition::from_severity_text("TRACé"),
+            SeverityPartition::Unspecified
+        );
     }
 
     #[test]

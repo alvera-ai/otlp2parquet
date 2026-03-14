@@ -114,10 +114,11 @@ async fn process_logs(
     );
 
     // Use batching if enabled, otherwise write directly
+    let severity_enabled = state.partition_logs_by_severity;
     if let Some(ref batcher) = state.batcher {
-        process_logs_batched(batcher, grouped, body_len, start).await
+        process_logs_batched(batcher, grouped, body_len, start, severity_enabled).await
     } else {
-        process_logs_direct(grouped, start).await
+        process_logs_direct(grouped, start, severity_enabled).await
     }
 }
 
@@ -127,6 +128,7 @@ async fn process_logs_batched(
     grouped: ServiceGroupedBatches,
     body_len: usize,
     start: Instant,
+    severity_enabled: bool,
 ) -> Result<Response, AppError> {
     let mut total_records: usize = 0;
     let mut buffered_records: usize = 0;
@@ -161,9 +163,11 @@ async fn process_logs_batched(
         } else {
             // Thresholds hit - flush completed batches
             for batch in completed {
-                let paths = persist_log_batch(&batch).await.map_err(|e| {
-                    AppError::internal(anyhow::anyhow!("Failed to flush batch: {}", e))
-                })?;
+                let paths = persist_log_batch(&batch, severity_enabled)
+                    .await
+                    .map_err(|e| {
+                        AppError::internal(anyhow::anyhow!("Failed to flush batch: {}", e))
+                    })?;
 
                 for path in &paths {
                     info!(
@@ -202,6 +206,7 @@ async fn process_logs_batched(
 async fn process_logs_direct(
     grouped: ServiceGroupedBatches,
     start: Instant,
+    severity_enabled: bool,
 ) -> Result<Response, AppError> {
     let write_start = Instant::now();
     let (uploaded_paths, total_records) = write_grouped_batches(
@@ -210,6 +215,7 @@ async fn process_logs_direct(
         None,
         "logs to storage",
         BatchWriteMode::Logs,
+        severity_enabled,
     )
     .await?;
     debug!(
@@ -260,6 +266,7 @@ async fn process_traces(
         None,
         "traces to storage",
         BatchWriteMode::Traces,
+        false,
     )
     .await?;
     debug!(
@@ -410,6 +417,7 @@ async fn write_metric_batches(
         BatchWriteMode::Metrics {
             metric_type: metric_type.as_str(),
         },
+        false,
     )
     .await?;
 
@@ -420,49 +428,71 @@ async fn write_metric_batches(
 /// Used by background flush and shutdown handlers.
 pub(crate) async fn persist_log_batch(
     completed: &CompletedBatch,
+    severity_enabled: bool,
 ) -> Result<Vec<String>, anyhow::Error> {
     let mut paths = Vec::new();
-    let severity_enabled = crate::writer::partition_logs_by_severity();
 
     for batch in &completed.batches {
         if batch.num_rows() == 0 {
             continue;
         }
 
-        let sub_batches = prepare_severity_sub_batches(batch, severity_enabled)
-            .map_err(|e| anyhow::anyhow!("Failed to split batch by severity: {}", e))?;
+        let written = write_batch_with_severity(
+            batch,
+            SignalType::Logs,
+            None,
+            &completed.metadata.service_name,
+            completed.metadata.first_timestamp_micros,
+            severity_enabled,
+        )
+        .await?;
 
-        for (severity, sub_batch) in &sub_batches {
-            let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
-                batch: sub_batch,
-                signal_type: SignalType::Logs,
-                metric_type: None,
-                service_name: &completed.metadata.service_name,
-                timestamp_micros: completed.metadata.first_timestamp_micros,
-                severity: *severity,
-            })
-            .await?;
-
-            counter!("otlp.batch.flushes").increment(1);
-            paths.push(path);
-        }
+        counter!("otlp.batch.flushes").increment(written.len() as u64);
+        paths.extend(written);
     }
 
     Ok(paths)
 }
 
-/// Prepare sub-batches for writing, splitting by severity when enabled.
-/// When disabled, returns the original batch with `severity: None`.
-fn prepare_severity_sub_batches(
+/// Write a batch (or severity-split sub-batches) to storage.
+/// When severity is disabled, writes the batch directly without cloning.
+async fn write_batch_with_severity(
     batch: &arrow::array::RecordBatch,
+    signal_type: SignalType,
+    metric_type: Option<&str>,
+    service_name: &str,
+    timestamp_micros: i64,
     severity_enabled: bool,
-) -> Result<Vec<(Option<crate::types::SeverityPartition>, arrow::array::RecordBatch)>, String> {
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut paths = Vec::new();
+
     if severity_enabled {
-        crate::codec::split_batch_by_severity(batch)
-            .map(|batches| batches.into_iter().map(|(sev, b)| (Some(sev), b)).collect())
+        for (sev, sub_batch) in crate::codec::split_batch_by_severity(batch)? {
+            let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
+                batch: &sub_batch,
+                signal_type,
+                metric_type,
+                service_name,
+                timestamp_micros,
+                severity: Some(sev),
+            })
+            .await?;
+            paths.push(path);
+        }
     } else {
-        Ok(vec![(None, batch.clone())])
+        let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
+            batch,
+            signal_type,
+            metric_type,
+            service_name,
+            timestamp_micros,
+            severity: None,
+        })
+        .await?;
+        paths.push(path);
     }
+
+    Ok(paths)
 }
 
 enum BatchWriteMode {
@@ -477,11 +507,10 @@ async fn write_grouped_batches(
     metric_type: Option<&str>,
     error_context: &'static str,
     mode: BatchWriteMode,
+    severity_enabled: bool,
 ) -> Result<(Vec<String>, usize), AppError> {
     let mut paths = Vec::new();
     let mut total_records = 0usize;
-    let severity_enabled =
-        matches!(mode, BatchWriteMode::Logs) && crate::writer::partition_logs_by_severity();
 
     for pb in grouped.batches {
         if pb.batch.num_rows() == 0 {
@@ -499,63 +528,47 @@ async fn write_grouped_batches(
             BatchWriteMode::Traces => {
                 counter!("otlp.ingest.records", "signal" => "traces")
                     .increment(pb.record_count as u64);
-                histogram!("otlp.batch.rows", "signal" => "traces")
-                    .record(pb.record_count as f64);
+                histogram!("otlp.batch.rows", "signal" => "traces").record(pb.record_count as f64);
             }
             BatchWriteMode::Metrics { .. } => {}
         }
 
-        let sub_batches =
-            prepare_severity_sub_batches(&pb.batch, severity_enabled).map_err(|e| {
-                AppError::internal(anyhow::anyhow!(
-                    "Failed to split batch by severity: {}",
-                    e
-                ))
-            })?;
+        let written = write_batch_with_severity(
+            &pb.batch,
+            signal_type,
+            metric_type,
+            &pb.service_name,
+            pb.min_timestamp_micros,
+            severity_enabled,
+        )
+        .await
+        .map_err(|e| {
+            AppError::internal(anyhow::anyhow!("Failed to write {}: {}", error_context, e))
+        })?;
 
-        for (severity, sub_batch) in &sub_batches {
-            let path = crate::writer::write_batch(crate::writer::WriteBatchRequest {
-                batch: sub_batch,
-                signal_type,
-                metric_type,
-                service_name: &pb.service_name,
-                timestamp_micros: pb.min_timestamp_micros,
-                severity: *severity,
-            })
-            .await
-            .map_err(|e| {
-                AppError::internal(anyhow::anyhow!(
-                    "Failed to write {}: {}",
-                    error_context,
-                    e
-                ))
-            })?;
-
+        for path in &written {
             match mode {
                 BatchWriteMode::Logs => {
                     counter!("otlp.batch.flushes").increment(1);
-                    info!(
-                        "Committed batch path={} service={} rows={}",
-                        path, pb.service_name, sub_batch.num_rows()
-                    );
+                    info!("Committed batch path={} service={}", path, pb.service_name);
                 }
                 BatchWriteMode::Traces => {
                     counter!("otlp.traces.flushes").increment(1);
                     info!(
-                        "Committed traces batch path={} service={} spans={}",
-                        path, pb.service_name, sub_batch.num_rows()
+                        "Committed traces batch path={} service={}",
+                        path, pb.service_name
                     );
                 }
                 BatchWriteMode::Metrics { metric_type } => {
                     counter!("otlp.metrics.flushes", "metric_type" => metric_type).increment(1);
                     info!(
-                        "Committed metrics batch path={} metric_type={} service={} points={}",
-                        path, metric_type, pb.service_name, sub_batch.num_rows()
+                        "Committed metrics batch path={} service={}",
+                        path, pb.service_name
                     );
                 }
             }
-            paths.push(path);
         }
+        paths.extend(written);
     }
 
     Ok((paths, total_records))

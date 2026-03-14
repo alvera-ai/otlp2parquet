@@ -44,8 +44,13 @@ async fn write_plain_parquet(
         )
     })?;
 
-    let file_path =
-        generate_parquet_path(signal_type, metric_type, service_name, timestamp_micros, severity)?;
+    let file_path = generate_parquet_path(
+        signal_type,
+        metric_type,
+        service_name,
+        timestamp_micros,
+        severity,
+    )?;
 
     tracing::debug!("Writing plain Parquet to path: {}", file_path);
 
@@ -127,15 +132,16 @@ fn generate_parquet_path(
     };
 
     Ok(format!(
-        "{}{}/{}/{}{}-{}.parquet",
+        "{}{}/{}/{}year={}/month={:02}/day={:02}/hour={:02}/{}-{}.parquet",
         storage_prefix,
         signal_prefix,
         safe_service,
         severity_segment,
-        format_args!(
-            "year={}/month={:02}/day={:02}/hour={:02}/{}",
-            year, month, day, hour, timestamp_micros
-        ),
+        year,
+        month,
+        day,
+        hour,
+        timestamp_micros,
         suffix
     ))
 }
@@ -251,9 +257,14 @@ mod tests {
 
     #[test]
     fn path_generation_sanitizes_service() {
-        let path =
-            generate_parquet_path(SignalType::Logs, None, "svc /name", 1_736_938_800_000_000, None)
-                .unwrap();
+        let path = generate_parquet_path(
+            SignalType::Logs,
+            None,
+            "svc /name",
+            1_736_938_800_000_000,
+            None,
+        )
+        .unwrap();
         assert!(path.starts_with("logs/svc__name/year="));
         assert!(path.contains("/month="));
         assert!(path.ends_with(".parquet"));
