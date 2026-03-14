@@ -425,33 +425,43 @@ async fn write_metric_batches(
 }
 
 /// Persist a completed batch from the BatchManager to storage.
-/// Used by background flush and shutdown handlers.
+/// Merges all accumulated RecordBatches into one before writing, so a single
+/// flush produces K files (one per severity) instead of N×K.
 pub(crate) async fn persist_log_batch(
     completed: &CompletedBatch,
     severity_enabled: bool,
 ) -> Result<Vec<String>, anyhow::Error> {
-    let mut paths = Vec::new();
+    let non_empty: Vec<&arrow::array::RecordBatch> = completed
+        .batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .collect();
 
-    for batch in &completed.batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-
-        let written = write_batch_with_severity(
-            batch,
-            SignalType::Logs,
-            None,
-            &completed.metadata.service_name,
-            completed.metadata.first_timestamp_micros,
-            severity_enabled,
-        )
-        .await?;
-
-        counter!("otlp.batch.flushes").increment(written.len() as u64);
-        paths.extend(written);
+    if non_empty.is_empty() {
+        return Ok(Vec::new());
     }
 
-    Ok(paths)
+    let merged = if non_empty.len() == 1 {
+        non_empty[0].clone()
+    } else {
+        let schema = non_empty[0].schema();
+        arrow::compute::concat_batches(&schema, non_empty.into_iter())
+            .map_err(|e| anyhow::anyhow!("Failed to merge batches before write: {}", e))?
+    };
+
+    let written = write_batch_with_severity(
+        &merged,
+        SignalType::Logs,
+        None,
+        &completed.metadata.service_name,
+        completed.metadata.first_timestamp_micros,
+        severity_enabled,
+    )
+    .await?;
+
+    counter!("otlp.batch.flushes").increment(written.len() as u64);
+
+    Ok(written)
 }
 
 /// Write a batch (or severity-split sub-batches) to storage.
