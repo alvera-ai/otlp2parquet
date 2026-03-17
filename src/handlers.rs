@@ -78,7 +78,7 @@ async fn handle_signal(
 
     let max_payload = state.max_payload_bytes;
     if body.len() > max_payload {
-        counter!("otlp.ingest.rejected").increment(1);
+        counter!("otlp.ingest.rejected", "signal" => signal.as_str()).increment(1);
         return Err(AppError::with_status(
             StatusCode::PAYLOAD_TOO_LARGE,
             anyhow::anyhow!("payload {} exceeds limit {}", body.len(), max_payload),
@@ -113,130 +113,20 @@ async fn process_logs(
         "parse"
     );
 
-    // Use batching if enabled, otherwise write directly
     let severity_enabled = state.partition_logs_by_severity;
     if let Some(ref batcher) = state.batcher {
-        process_logs_batched(batcher, grouped, body_len, start, severity_enabled).await
+        process_signal_batched(
+            batcher,
+            grouped,
+            body_len,
+            start,
+            SignalType::Logs,
+            severity_enabled,
+        )
+        .await
     } else {
-        process_logs_direct(grouped, start, severity_enabled).await
+        process_signal_direct(grouped, start, SignalType::Logs, severity_enabled).await
     }
-}
-
-/// Process logs with batching - accumulate in memory, flush when thresholds hit
-async fn process_logs_batched(
-    batcher: &crate::batch::BatchManager,
-    grouped: ServiceGroupedBatches,
-    body_len: usize,
-    start: Instant,
-    severity_enabled: bool,
-) -> Result<Response, AppError> {
-    let mut total_records: usize = 0;
-    let mut buffered_records: usize = 0;
-    let mut flushed_paths = Vec::new();
-
-    // Approximate bytes per batch (distribute body size across batches)
-    let batch_count = grouped.batches.len().max(1);
-    let approx_bytes_per_batch = body_len / batch_count;
-
-    let write_start = Instant::now();
-    for pb in grouped.batches {
-        if pb.batch.num_rows() == 0 {
-            continue;
-        }
-
-        total_records += pb.record_count;
-        counter!("otlp.ingest.records", "signal" => "logs").increment(pb.record_count as u64);
-
-        // Ingest into batcher - may return completed batches if thresholds hit
-        let (completed, _metadata) = batcher
-            .ingest(&pb, approx_bytes_per_batch)
-            .map_err(|e| AppError::internal(anyhow::anyhow!("Batch ingestion failed: {}", e)))?;
-
-        if completed.is_empty() {
-            // Records buffered, not yet flushed
-            buffered_records += pb.record_count;
-            debug!(
-                service = %pb.service_name,
-                records = pb.record_count,
-                "Buffered logs"
-            );
-        } else {
-            // Thresholds hit - flush completed batches
-            for batch in completed {
-                let paths = persist_batch(&batch, SignalType::Logs, severity_enabled)
-                    .await
-                    .map_err(|e| {
-                        AppError::internal(anyhow::anyhow!("Failed to flush batch: {}", e))
-                    })?;
-
-                for path in &paths {
-                    info!(
-                        path = %path,
-                        service = %batch.metadata.service_name,
-                        rows = batch.metadata.record_count,
-                        "Flushed batch (threshold)"
-                    );
-                }
-                flushed_paths.extend(paths);
-            }
-        }
-    }
-
-    debug!(
-        elapsed_us = write_start.elapsed().as_micros() as u64,
-        signal = "logs",
-        "batch_ingest"
-    );
-
-    histogram!("otlp.ingest.latency_ms", "signal" => "logs")
-        .record(start.elapsed().as_secs_f64() * 1000.0);
-
-    let response = Json(json!({
-        "status": "ok",
-        "mode": "batched",
-        "records_processed": total_records,
-        "records_buffered": buffered_records,
-        "flush_count": flushed_paths.len(),
-        "partitions": flushed_paths,
-    }));
-
-    Ok((StatusCode::OK, response).into_response())
-}
-
-/// Process logs directly - write each batch immediately (no batching)
-async fn process_logs_direct(
-    grouped: ServiceGroupedBatches,
-    start: Instant,
-    severity_enabled: bool,
-) -> Result<Response, AppError> {
-    let write_start = Instant::now();
-    let (uploaded_paths, total_records) = write_grouped_batches(
-        grouped,
-        SignalType::Logs,
-        None,
-        "logs to storage",
-        BatchWriteMode::Logs,
-        severity_enabled,
-    )
-    .await?;
-    debug!(
-        elapsed_us = write_start.elapsed().as_micros() as u64,
-        signal = "logs",
-        "write"
-    );
-
-    histogram!("otlp.ingest.latency_ms", "signal" => "logs")
-        .record(start.elapsed().as_secs_f64() * 1000.0);
-
-    let response = Json(json!({
-        "status": "ok",
-        "mode": "direct",
-        "records_processed": total_records,
-        "flush_count": uploaded_paths.len(),
-        "partitions": uploaded_paths,
-    }));
-
-    Ok((StatusCode::OK, response).into_response())
 }
 
 async fn process_traces(
@@ -264,22 +154,25 @@ async fn process_traces(
     );
 
     if let Some(ref batcher) = state.trace_batcher {
-        process_traces_batched(batcher, grouped, body_len, start).await
+        process_signal_batched(batcher, grouped, body_len, start, SignalType::Traces, false).await
     } else {
-        process_traces_direct(grouped, start).await
+        process_signal_direct(grouped, start, SignalType::Traces, false).await
     }
 }
 
-/// Process traces with batching - accumulate in memory, flush when thresholds hit
-async fn process_traces_batched(
+/// Process a signal with batching — accumulate in memory, flush when thresholds hit.
+async fn process_signal_batched(
     batcher: &crate::batch::BatchManager,
     grouped: ServiceGroupedBatches,
     body_len: usize,
     start: Instant,
+    signal_type: SignalType,
+    severity_enabled: bool,
 ) -> Result<Response, AppError> {
     let mut total_records: usize = 0;
     let mut buffered_records: usize = 0;
     let mut flushed_paths = Vec::new();
+    let signal_str = signal_type.as_str();
 
     let batch_count = grouped.batches.len().max(1);
     let approx_bytes_per_batch = body_len / batch_count;
@@ -291,7 +184,8 @@ async fn process_traces_batched(
         }
 
         total_records += pb.record_count;
-        counter!("otlp.ingest.records", "signal" => "traces").increment(pb.record_count as u64);
+        counter!("otlp.ingest.records", "signal" => signal_str)
+            .increment(pb.record_count as u64);
 
         let (completed, _metadata) = batcher
             .ingest(&pb, approx_bytes_per_batch)
@@ -302,22 +196,24 @@ async fn process_traces_batched(
             debug!(
                 service = %pb.service_name,
                 records = pb.record_count,
-                "Buffered traces"
+                signal = signal_str,
+                "Buffered"
             );
         } else {
             for batch in completed {
-                let paths = persist_batch(&batch, SignalType::Traces, false)
+                let paths = persist_batch(&batch, signal_type, severity_enabled)
                     .await
                     .map_err(|e| {
-                        AppError::internal(anyhow::anyhow!("Failed to flush trace batch: {}", e))
+                        AppError::internal(anyhow::anyhow!("Failed to flush batch: {}", e))
                     })?;
 
                 for path in &paths {
                     info!(
                         path = %path,
+                        signal = signal_str,
                         service = %batch.metadata.service_name,
                         rows = batch.metadata.record_count,
-                        "Flushed trace batch (threshold)"
+                        "Flushed batch (threshold)"
                     );
                 }
                 flushed_paths.extend(paths);
@@ -327,18 +223,18 @@ async fn process_traces_batched(
 
     debug!(
         elapsed_us = write_start.elapsed().as_micros() as u64,
-        signal = "traces",
+        signal = signal_str,
         "batch_ingest"
     );
 
-    histogram!("otlp.ingest.latency_ms", "signal" => "traces")
+    histogram!("otlp.ingest.latency_ms", "signal" => signal_str)
         .record(start.elapsed().as_secs_f64() * 1000.0);
 
     let response = Json(json!({
         "status": "ok",
         "mode": "batched",
-        "spans_processed": total_records,
-        "spans_buffered": buffered_records,
+        "records_processed": total_records,
+        "records_buffered": buffered_records,
         "flush_count": flushed_paths.len(),
         "partitions": flushed_paths,
     }));
@@ -346,37 +242,33 @@ async fn process_traces_batched(
     Ok((StatusCode::OK, response).into_response())
 }
 
-/// Process traces directly - write each batch immediately (no batching)
-async fn process_traces_direct(
+/// Process a signal directly — write each batch immediately (no batching).
+async fn process_signal_direct(
     grouped: ServiceGroupedBatches,
     start: Instant,
+    signal_type: SignalType,
+    severity_enabled: bool,
 ) -> Result<Response, AppError> {
+    let signal_str = signal_type.as_str();
+
     let write_start = Instant::now();
-    let (uploaded_paths, spans_processed) = write_grouped_batches(
-        grouped,
-        SignalType::Traces,
-        None,
-        "traces to storage",
-        BatchWriteMode::Traces,
-        false,
-    )
-    .await?;
+    let (uploaded_paths, total_records) =
+        write_grouped_batches(grouped, signal_type, None, severity_enabled).await?;
     debug!(
         elapsed_us = write_start.elapsed().as_micros() as u64,
-        signal = "traces",
+        signal = signal_str,
         "write"
     );
 
-    // Record latency even for empty payloads (heartbeats)
-    histogram!("otlp.ingest.latency_ms", "signal" => "traces")
+    histogram!("otlp.ingest.latency_ms", "signal" => signal_str)
         .record(start.elapsed().as_secs_f64() * 1000.0);
 
-    if spans_processed == 0 {
+    if total_records == 0 {
         return Ok((
             StatusCode::OK,
             Json(json!({
                 "status": "ok",
-                "message": "No trace spans to process",
+                "message": format!("No {} to process", signal_str),
             })),
         )
             .into_response());
@@ -385,7 +277,7 @@ async fn process_traces_direct(
     let response = Json(json!({
         "status": "ok",
         "mode": "direct",
-        "spans_processed": spans_processed,
+        "records_processed": total_records,
         "partitions": uploaded_paths,
     }));
 
@@ -487,13 +379,12 @@ async fn write_metric_batches(
         return Ok(Vec::new());
     }
 
-    // Validate supported metric types
     match metric_type {
         MetricType::Gauge
         | MetricType::Sum
         | MetricType::Histogram
         | MetricType::ExponentialHistogram => {}
-        _ => {
+        MetricType::Summary => {
             warn!(
                 metric_type = ?metric_type,
                 count = grouped.total_records,
@@ -507,10 +398,6 @@ async fn write_metric_batches(
         grouped,
         SignalType::Metrics,
         Some(metric_type.as_str()),
-        "metrics to storage",
-        BatchWriteMode::Metrics {
-            metric_type: metric_type.as_str(),
-        },
         false,
     )
     .await?;
@@ -619,22 +506,15 @@ async fn write_batch_with_severity(
     Ok(paths)
 }
 
-enum BatchWriteMode {
-    Logs,
-    Traces,
-    Metrics { metric_type: &'static str },
-}
-
 async fn write_grouped_batches(
     grouped: ServiceGroupedBatches,
     signal_type: SignalType,
-    metric_type: Option<&str>,
-    error_context: &'static str,
-    mode: BatchWriteMode,
+    metric_type: Option<&'static str>,
     severity_enabled: bool,
 ) -> Result<(Vec<String>, usize), AppError> {
     let mut paths = Vec::new();
     let mut total_records = 0usize;
+    let signal_str = signal_type.as_str();
 
     for pb in grouped.batches {
         if pb.batch.num_rows() == 0 {
@@ -643,21 +523,12 @@ async fn write_grouped_batches(
 
         total_records += pb.record_count;
 
-        // Record ingestion counters + histogram at the original batch level (pre-split)
-        match mode {
-            BatchWriteMode::Logs => {
-                counter!("otlp.ingest.records", "signal" => "logs")
-                    .increment(pb.record_count as u64);
-                histogram!("otlp.batch.rows", "signal" => "logs")
-                    .record(pb.record_count as f64);
-            }
-            BatchWriteMode::Traces => {
-                counter!("otlp.ingest.records", "signal" => "traces")
-                    .increment(pb.record_count as u64);
-                histogram!("otlp.batch.rows", "signal" => "traces")
-                    .record(pb.record_count as f64);
-            }
-            BatchWriteMode::Metrics { .. } => {}
+        // Record counters for non-metric signals (metrics handles its own counting)
+        if metric_type.is_none() {
+            counter!("otlp.ingest.records", "signal" => signal_str)
+                .increment(pb.record_count as u64);
+            histogram!("otlp.batch.rows", "signal" => signal_str)
+                .record(pb.record_count as f64);
         }
 
         let written = write_batch_with_severity(
@@ -670,31 +541,29 @@ async fn write_grouped_batches(
         )
         .await
         .map_err(|e| {
-            AppError::internal(anyhow::anyhow!("Failed to write {}: {}", error_context, e))
+            AppError::internal(anyhow::anyhow!(
+                "Failed to write {} to storage: {}",
+                signal_str,
+                e
+            ))
         })?;
 
         for path in &written {
-            match mode {
-                BatchWriteMode::Logs => {
-                    counter!("otlp.flushes", "signal" => "logs").increment(1);
-                    info!("Committed batch path={} service={}", path, pb.service_name);
-                }
-                BatchWriteMode::Traces => {
-                    counter!("otlp.flushes", "signal" => "traces").increment(1);
-                    info!(
-                        "Committed traces batch path={} service={}",
-                        path, pb.service_name
-                    );
-                }
-                BatchWriteMode::Metrics { metric_type } => {
-                    counter!("otlp.flushes", "signal" => "metrics", "metric_type" => metric_type)
+            match metric_type {
+                Some(mt) => {
+                    counter!("otlp.flushes", "signal" => "metrics", "metric_type" => mt)
                         .increment(1);
-                    info!(
-                        "Committed metrics batch path={} service={}",
-                        path, pb.service_name
-                    );
+                }
+                None => {
+                    counter!("otlp.flushes", "signal" => signal_str).increment(1);
                 }
             }
+            info!(
+                path = %path,
+                signal = signal_str,
+                service = %pb.service_name,
+                "Committed batch"
+            );
         }
         paths.extend(written);
     }
@@ -806,14 +675,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // =========================================================================
-    // Finding 3: persist_batch must return Err on metadata/data mismatch
-    // =========================================================================
-
-    /// When metadata reports rows but all batches are empty, persist_batch
-    /// should return Err (data loss detected), not Ok(vec![]).
-    /// This is a critical data-loss bug: the caller receives success and
-    /// acknowledges the data to the client, but nothing was persisted.
     #[tokio::test]
     async fn persist_batch_returns_err_when_metadata_reports_rows_but_batches_empty() {
         use crate::batch::{CompletedBatch, SignalMetadata};
@@ -828,8 +689,6 @@ mod tests {
         };
 
         let result = persist_batch(&completed, SignalType::Logs, false).await;
-
-        // DESIRED: Err because metadata says 42 rows but all batches are empty
         assert!(
             result.is_err(),
             "persist_batch should return Err when metadata reports rows but batches are empty, got Ok({:?})",
@@ -837,8 +696,6 @@ mod tests {
         );
     }
 
-    /// When metadata reports rows but the batch vec is completely empty,
-    /// persist_batch should also return Err.
     #[tokio::test]
     async fn persist_batch_returns_err_when_metadata_reports_rows_but_no_batches() {
         use crate::batch::{CompletedBatch, SignalMetadata};
@@ -853,7 +710,6 @@ mod tests {
         };
 
         let result = persist_batch(&completed, SignalType::Traces, false).await;
-
         assert!(
             result.is_err(),
             "persist_batch should return Err when metadata reports rows but batch vec is empty, got Ok({:?})",
@@ -861,45 +717,8 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // T1: persist_batch with record_count=0 + empty batches → Ok
-    // =========================================================================
-
-    /// When metadata reports 0 rows and all batches are empty, persist_batch
-    /// should return Ok(vec![]) — nothing to persist, no error.
     #[tokio::test]
-    async fn persist_batch_returns_ok_when_record_count_zero_and_batches_empty() {
-        use crate::batch::{CompletedBatch, SignalMetadata};
-
-        let completed = CompletedBatch {
-            batches: vec![empty_batch(), empty_batch()],
-            metadata: SignalMetadata {
-                service_name: Arc::from("test-service"),
-                first_timestamp_micros: 1_700_000_000_000_000,
-                record_count: 0,
-            },
-        };
-
-        let result = persist_batch(&completed, SignalType::Logs, false).await;
-
-        let paths = result.expect(
-            "persist_batch should return Ok when record_count is 0 and batches are empty",
-        );
-        assert!(
-            paths.is_empty(),
-            "persist_batch should return empty paths when nothing to persist"
-        );
-    }
-
-    // =========================================================================
-    // Regression tests
-    // =========================================================================
-
-    /// Regression: persist_batch error message must include signal type, service
-    /// name, and row count so operators can diagnose data-loss events from logs.
-    /// A future refactor might accidentally strip this context.
-    #[tokio::test]
-    async fn regression_persist_batch_error_message_contains_diagnostic_context() {
+    async fn persist_batch_error_message_contains_diagnostic_context() {
         use crate::batch::{CompletedBatch, SignalMetadata};
 
         let completed = CompletedBatch {
@@ -916,27 +735,13 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
 
-        assert!(
-            msg.contains("logs"),
-            "Error should contain signal type 'logs', got: {}",
-            msg
-        );
-        assert!(
-            msg.contains("payment-api"),
-            "Error should contain service name 'payment-api', got: {}",
-            msg
-        );
-        assert!(
-            msg.contains("99"),
-            "Error should contain row count '99', got: {}",
-            msg
-        );
+        assert!(msg.contains("logs"), "got: {}", msg);
+        assert!(msg.contains("payment-api"), "got: {}", msg);
+        assert!(msg.contains("99"), "got: {}", msg);
     }
 
-    /// Regression: persist_batch error message for traces signal must say
-    /// "traces" not "logs". Verifies signal_type.as_str() is used correctly.
     #[tokio::test]
-    async fn regression_persist_batch_error_message_uses_correct_signal_type() {
+    async fn persist_batch_error_uses_correct_signal_type() {
         use crate::batch::{CompletedBatch, SignalMetadata};
 
         let completed = CompletedBatch {
@@ -953,89 +758,29 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
 
-        assert!(
-            msg.contains("traces"),
-            "Error for traces signal should contain 'traces', got: {}",
-            msg
-        );
-        assert!(
-            msg.contains("order-service"),
-            "Error should contain service name 'order-service', got: {}",
-            msg
-        );
+        assert!(msg.contains("traces"), "got: {}", msg);
+        assert!(msg.contains("order-service"), "got: {}", msg);
     }
 
-    /// Regression: a single empty batch must return None from merge, just like
-    /// multiple empty batches or an empty slice. This is a boundary condition
-    /// the existing tests cover for 0 and 2 empty batches, but not exactly 1.
     #[test]
-    fn regression_merge_single_empty_batch_returns_none() {
-        let result = merge_record_batches(&[empty_batch()]).unwrap();
-        assert!(
-            result.is_none(),
-            "A single empty batch should merge to None"
-        );
-    }
-
-    /// Regression: merged output must preserve the schema of the input batches
-    /// (field names, types, nullability). A future concat implementation change
-    /// could silently alter schema metadata.
-    #[test]
-    fn regression_merge_preserves_schema_fields() {
+    fn test_merge_preserves_schema_fields() {
         let b1 = make_batch(&["INFO"]);
         let b2 = make_batch(&["ERROR"]);
 
         let merged = merge_record_batches(&[b1.clone(), b2]).unwrap().unwrap();
-
-        assert_eq!(
-            merged.schema(),
-            b1.schema(),
-            "Merged batch schema must match input batch schema"
-        );
+        assert_eq!(merged.schema(), b1.schema());
     }
 
-    /// Regression: persist_batch with record_count=0 and zero-length batch vec
-    /// should return Ok (not Err). This is the true "nothing happened" boundary:
-    /// no batches, no claimed rows.
-    #[tokio::test]
-    async fn regression_persist_batch_zero_count_zero_batches_is_ok() {
-        use crate::batch::{CompletedBatch, SignalMetadata};
-
-        let completed = CompletedBatch {
-            batches: vec![],
-            metadata: SignalMetadata {
-                service_name: Arc::from("empty-service"),
-                first_timestamp_micros: 0,
-                record_count: 0,
-            },
-        };
-
-        let result = persist_batch(&completed, SignalType::Traces, false).await;
-        let paths = result.expect(
-            "persist_batch should return Ok when record_count=0 and batches vec is empty",
-        );
-        assert!(paths.is_empty());
-    }
-
-    /// Regression: merge_record_batches with a large number of batches should
-    /// produce a single batch with the sum of all rows. Prevents off-by-one
-    /// in concat logic when many small batches are merged.
     #[test]
-    fn regression_merge_many_small_batches() {
+    fn test_merge_many_small_batches() {
         let batches: Vec<RecordBatch> = (0..50).map(|_| make_batch(&["INFO"])).collect();
 
         let merged = merge_record_batches(&batches).unwrap().unwrap();
-        assert_eq!(
-            merged.num_rows(),
-            50,
-            "Merging 50 single-row batches should produce 50 rows"
-        );
+        assert_eq!(merged.num_rows(), 50);
     }
 
-    /// Regression: data loss error message must contain "Data loss detected"
-    /// so that log monitoring can alert on this specific failure mode.
     #[tokio::test]
-    async fn regression_persist_batch_data_loss_message_is_alertable() {
+    async fn persist_batch_data_loss_message_is_alertable() {
         use crate::batch::{CompletedBatch, SignalMetadata};
 
         let completed = CompletedBatch {

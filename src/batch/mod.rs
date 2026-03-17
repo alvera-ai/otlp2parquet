@@ -2,13 +2,8 @@
 //!
 //! Accumulates Arrow batches in memory and merges them into larger Arrow batches.
 //! This reduces the number of storage writes and improves compression efficiency.
-//!
-//! Note: This module provides the batching infrastructure for when `batch.enabled=true`
-//! in the server config. Currently the handlers write directly per-request, but this
-//! infrastructure is available for future use.
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,16 +23,16 @@ struct BatchKey {
 }
 
 impl BatchKey {
-    fn from_metadata<M: BatchMetadata>(metadata: &M) -> Self {
-        let bucket = if metadata.first_timestamp_micros() > 0 {
+    fn from_metadata(metadata: &SignalMetadata) -> Self {
+        let bucket = if metadata.first_timestamp_micros > 0 {
             // Metadata timestamps are stored in microseconds; bucket by minute in micros.
-            metadata.first_timestamp_micros() / 60_000_000
+            metadata.first_timestamp_micros / 60_000_000
         } else {
             0
         };
 
         Self {
-            service: metadata.service_name().as_ref().to_string(),
+            service: metadata.service_name.as_ref().to_string(),
             minute_bucket: bucket,
         }
     }
@@ -59,101 +54,32 @@ pub struct SignalMetadata {
     pub record_count: usize,
 }
 
-/// Metadata required by the batching layer.
-pub trait BatchMetadata: Clone {
-    fn service_name(&self) -> &Arc<str>;
-    /// Stored in microseconds.
-    fn first_timestamp_micros(&self) -> i64;
-    fn record_count(&self) -> usize;
-    fn aggregate(service_name: Arc<str>, first_timestamp_micros: i64, record_count: usize) -> Self;
-}
-
-impl BatchMetadata for SignalMetadata {
-    fn service_name(&self) -> &Arc<str> {
-        &self.service_name
-    }
-
-    fn first_timestamp_micros(&self) -> i64 {
-        self.first_timestamp_micros
-    }
-
-    fn record_count(&self) -> usize {
-        self.record_count
-    }
-
-    fn aggregate(service_name: Arc<str>, first_timestamp_micros: i64, record_count: usize) -> Self {
-        Self {
-            service_name,
-            first_timestamp_micros,
-            record_count,
-        }
-    }
-}
-
-/// Signal-specific logic used by the batching layer.
-pub trait SignalProcessor {
-    type Request;
-    type Metadata: BatchMetadata;
-
-    fn estimate_row_count(request: &Self::Request) -> usize;
-    fn convert_request(
-        request: &Self::Request,
-        capacity_hint: usize,
-    ) -> Result<(Vec<RecordBatch>, Self::Metadata)>;
-}
-
-type BatchIngestResult<M> = Result<(Vec<CompletedBatch<M>>, M)>;
-
-/// Default signal processor using Arrow-native PartitionedBatch.
-/// Works for any signal type (logs, traces) that decodes into PartitionedBatch.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultSignalProcessor;
-
-impl SignalProcessor for DefaultSignalProcessor {
-    type Request = PartitionedBatch;
-    type Metadata = SignalMetadata;
-
-    fn estimate_row_count(request: &Self::Request) -> usize {
-        request.record_count
-    }
-
-    fn convert_request(
-        request: &Self::Request,
-        _capacity_hint: usize,
-    ) -> Result<(Vec<RecordBatch>, Self::Metadata)> {
-        let metadata = SignalMetadata {
-            service_name: Arc::clone(&request.service_name),
-            first_timestamp_micros: request.min_timestamp_micros,
-            record_count: request.record_count,
-        };
-        Ok((vec![request.batch.clone()], metadata))
-    }
-}
-
-/// Completed batch ready for storage
+/// Completed batch ready for storage.
 ///
 /// Contains merged Arrow RecordBatch + metadata.
 /// Hashing and serialization happen in the storage layer.
 #[derive(Debug)]
-pub struct CompletedBatch<M: BatchMetadata = SignalMetadata> {
+pub struct CompletedBatch {
     pub batches: Vec<RecordBatch>,
-    pub metadata: M,
+    pub metadata: SignalMetadata,
 }
 
+/// Maximum ratio of pending bytes to configured max_bytes before backpressure kicks in.
+const BACKPRESSURE_MULTIPLIER: usize = 8;
+
 /// Thread-safe batch orchestrator shared across handlers.
-pub struct BatchManager<P: SignalProcessor = DefaultSignalProcessor> {
+pub struct BatchManager {
     config: BatchConfig,
-    inner: Arc<Mutex<BatchState<P>>>,
-    _marker: PhantomData<P>,
+    inner: Arc<Mutex<BatchState>>,
 }
 
 #[derive(Debug)]
-struct BatchState<P: SignalProcessor> {
-    batches: HashMap<BatchKey, BufferedBatch<P::Metadata>>,
+struct BatchState {
+    batches: HashMap<BatchKey, BufferedBatch>,
     total_bytes: usize,
 }
 
-impl<P: SignalProcessor> BatchManager<P> {
+impl BatchManager {
     pub fn new(config: BatchConfig) -> Self {
         Self {
             config,
@@ -161,29 +87,27 @@ impl<P: SignalProcessor> BatchManager<P> {
                 batches: HashMap::new(),
                 total_bytes: 0,
             })),
-            _marker: PhantomData,
         }
     }
 
     pub fn ingest(
         &self,
-        request: &P::Request,
+        request: &PartitionedBatch,
         approx_bytes: usize,
-    ) -> BatchIngestResult<P::Metadata> {
-        let capacity_hint = P::estimate_row_count(request);
-        let (batches, metadata) = P::convert_request(request, capacity_hint)?;
+    ) -> Result<(Vec<CompletedBatch>, SignalMetadata)> {
+        let metadata = SignalMetadata {
+            service_name: Arc::clone(&request.service_name),
+            first_timestamp_micros: request.min_timestamp_micros,
+            record_count: request.record_count,
+        };
 
-        if metadata.record_count() == 0 {
+        if metadata.record_count == 0 {
             return Ok((Vec::new(), metadata));
         }
 
         let key = BatchKey::from_metadata(&metadata);
         let mut guard = self.inner.lock();
-        let max_pending_bytes = self
-            .config
-            .max_bytes
-            .saturating_mul(8)
-            .max(self.config.max_bytes);
+        let max_pending_bytes = self.config.max_bytes.saturating_mul(BACKPRESSURE_MULTIPLIER);
 
         let prospective_total = guard.total_bytes.saturating_add(approx_bytes);
         if prospective_total > max_pending_bytes {
@@ -200,7 +124,7 @@ impl<P: SignalProcessor> BatchManager<P> {
                 .batches
                 .entry(key.clone())
                 .or_insert_with(|| BufferedBatch::new(&metadata));
-            buffered.add_batches(batches, &metadata, approx_bytes);
+            buffered.add_batches(vec![request.batch.clone()], &metadata, approx_bytes);
             buffered.should_flush(&self.config)
         };
 
@@ -221,7 +145,7 @@ impl<P: SignalProcessor> BatchManager<P> {
         Ok((completed, metadata))
     }
 
-    pub fn drain_expired(&self) -> Result<Vec<CompletedBatch<P::Metadata>>> {
+    pub fn drain_expired(&self) -> Result<Vec<CompletedBatch>> {
         let mut guard = self.inner.lock();
         let mut completed = Vec::new();
         let keys: Vec<BatchKey> = guard
@@ -241,7 +165,7 @@ impl<P: SignalProcessor> BatchManager<P> {
         Ok(completed)
     }
 
-    pub fn drain_all(&self) -> Result<Vec<CompletedBatch<P::Metadata>>> {
+    pub fn drain_all(&self) -> Result<Vec<CompletedBatch>> {
         let mut guard = self.inner.lock();
         let drained: Vec<_> = guard.batches.drain().collect();
         guard.total_bytes = 0;
@@ -259,10 +183,9 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray, TimestampMillisecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use std::sync::Arc as StdArc;
 
     fn create_test_batch(service_name: &str, record_count: usize) -> PartitionedBatch {
-        let schema = StdArc::new(Schema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "timestamp",
                 DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -281,9 +204,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                StdArc::new(TimestampMillisecondArray::from(timestamps.clone())),
-                StdArc::new(StringArray::from(services)),
-                StdArc::new(Int64Array::from(severities)),
+                Arc::new(TimestampMillisecondArray::from(timestamps.clone())),
+                Arc::new(StringArray::from(services)),
+                Arc::new(Int64Array::from(severities)),
             ],
         )
         .unwrap();
@@ -303,7 +226,7 @@ mod tests {
             max_bytes: 1024 * 1024,
             max_age: Duration::from_secs(10),
         };
-        let manager = BatchManager::<DefaultSignalProcessor>::new(config);
+        let manager = BatchManager::new(config);
 
         // First request - should not flush
         let request1 = create_test_batch("test-service", 10);
@@ -323,7 +246,7 @@ mod tests {
             max_bytes: 1024 * 1024,
             max_age: Duration::from_secs(10),
         };
-        let manager_small = BatchManager::<DefaultSignalProcessor>::new(config_small);
+        let manager_small = BatchManager::new(config_small);
 
         let req1 = create_test_batch("test-service", 10);
         let approx_small_1 = 320;

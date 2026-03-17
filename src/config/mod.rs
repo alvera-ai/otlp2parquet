@@ -48,8 +48,6 @@ fn default_batching_enabled() -> bool {
     true
 }
 
-impl BatchConfig {}
-
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
