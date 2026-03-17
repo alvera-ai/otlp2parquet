@@ -86,77 +86,55 @@ async fn handle_signal(
     }
 
     match signal {
-        SignalType::Logs => process_logs(state, format, body).await,
-        SignalType::Traces => process_traces(state, format, body).await,
+        SignalType::Logs | SignalType::Traces => {
+            process_signal(state, signal, format, body).await
+        }
+        // Metrics use direct writes only — batching not implemented for 5 metric schemas
         SignalType::Metrics => process_metrics(format, body).await,
     }
 }
 
-async fn process_logs(
+async fn process_signal(
     state: &AppState,
+    signal_type: SignalType,
     format: InputFormat,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
-    let body_len = body.len();
-    counter!("otlp.ingest.requests", "signal" => "logs").increment(1);
-    histogram!("otlp.ingest.bytes", "signal" => "logs").record(body_len as f64);
+    let signal_str = signal_type.as_str();
+    counter!("otlp.ingest.requests", "signal" => signal_str).increment(1);
+    histogram!("otlp.ingest.bytes", "signal" => signal_str).record(body.len() as f64);
 
     let parse_start = Instant::now();
-    let grouped = decode_logs_partitioned(&body, format).map_err(|e| {
-        AppError::bad_request(anyhow::anyhow!("Failed to parse OTLP logs request: {}", e))
-    })?;
-    debug!(
-        elapsed_us = parse_start.elapsed().as_micros() as u64,
-        signal = "logs",
-        records = grouped.total_records,
-        "parse"
-    );
-
-    let severity_enabled = state.partition_logs_by_severity;
-    if let Some(ref batcher) = state.batcher {
-        process_signal_batched(
-            batcher,
-            grouped,
-            body_len,
-            start,
-            SignalType::Logs,
-            severity_enabled,
-        )
-        .await
-    } else {
-        process_signal_direct(grouped, start, SignalType::Logs, severity_enabled).await
+    let grouped = match signal_type {
+        SignalType::Logs => decode_logs_partitioned(&body, format),
+        SignalType::Traces => decode_traces_partitioned(&body, format),
+        SignalType::Metrics => unreachable!("metrics handled separately"),
     }
-}
-
-async fn process_traces(
-    state: &AppState,
-    format: InputFormat,
-    body: axum::body::Bytes,
-) -> Result<Response, AppError> {
-    let start = Instant::now();
-    let body_len = body.len();
-    counter!("otlp.ingest.requests", "signal" => "traces").increment(1);
-    histogram!("otlp.ingest.bytes", "signal" => "traces").record(body_len as f64);
-
-    let parse_start = Instant::now();
-    let grouped = decode_traces_partitioned(&body, format).map_err(|e| {
+    .map_err(|e| {
         AppError::bad_request(anyhow::anyhow!(
-            "Failed to parse OTLP traces request: {}",
+            "Failed to parse OTLP {} request: {}",
+            signal_str,
             e
         ))
     })?;
     debug!(
         elapsed_us = parse_start.elapsed().as_micros() as u64,
-        signal = "traces",
-        spans = grouped.total_records,
+        signal = signal_str,
+        records = grouped.total_records,
         "parse"
     );
 
-    if let Some(ref batcher) = state.trace_batcher {
-        process_signal_batched(batcher, grouped, body_len, start, SignalType::Traces, false).await
+    let (batcher, severity_enabled) = match signal_type {
+        SignalType::Logs => (&state.batcher, state.partition_logs_by_severity),
+        SignalType::Traces => (&state.trace_batcher, false),
+        SignalType::Metrics => unreachable!(),
+    };
+
+    if let Some(ref batcher) = batcher {
+        process_signal_batched(batcher, grouped, start, signal_type, severity_enabled).await
     } else {
-        process_signal_direct(grouped, start, SignalType::Traces, false).await
+        process_signal_direct(grouped, start, signal_type, severity_enabled).await
     }
 }
 
@@ -164,7 +142,6 @@ async fn process_traces(
 async fn process_signal_batched(
     batcher: &crate::batch::BatchManager,
     grouped: ServiceGroupedBatches,
-    body_len: usize,
     start: Instant,
     signal_type: SignalType,
     severity_enabled: bool,
@@ -173,9 +150,6 @@ async fn process_signal_batched(
     let mut buffered_records: usize = 0;
     let mut flushed_paths = Vec::new();
     let signal_str = signal_type.as_str();
-
-    let batch_count = grouped.batches.len().max(1);
-    let approx_bytes_per_batch = body_len / batch_count;
 
     let write_start = Instant::now();
     for pb in grouped.batches {
@@ -187,8 +161,10 @@ async fn process_signal_batched(
         counter!("otlp.ingest.records", "signal" => signal_str)
             .increment(pb.record_count as u64);
 
+        // Use Arrow in-memory size for accurate backpressure (not wire-format body size)
+        let approx_bytes = pb.batch.get_array_memory_size();
         let (completed, _metadata) = batcher
-            .ingest(&pb, approx_bytes_per_batch)
+            .ingest(&pb, approx_bytes)
             .map_err(|e| AppError::internal(anyhow::anyhow!("Batch ingestion failed: {}", e)))?;
 
         if completed.is_empty() {

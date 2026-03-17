@@ -28,6 +28,11 @@ impl BatchKey {
             // Metadata timestamps are stored in microseconds; bucket by minute in micros.
             metadata.first_timestamp_micros / 60_000_000
         } else {
+            tracing::warn!(
+                service = %metadata.service_name,
+                timestamp_micros = metadata.first_timestamp_micros,
+                "Batch has non-positive timestamp — bucketed to epoch 0"
+            );
             0
         };
 
@@ -137,32 +142,56 @@ impl BatchManager {
                 .remove(&key)
                 .ok_or_else(|| anyhow!("batch evicted before flush: {:?}", key))?;
             guard.total_bytes = guard.total_bytes.saturating_sub(batch.total_bytes());
-            completed.push(batch.finalize()?);
-        }
+            drop(guard);
 
-        drop(guard);
+            match batch.finalize() {
+                Ok(c) => completed.push(c),
+                Err(e) => {
+                    // Batch already removed from map — data lost on this hot path.
+                    // Error propagates to HTTP handler → 500 → OTLP client retries.
+                    tracing::error!(
+                        service = %metadata.service_name,
+                        rows = metadata.record_count,
+                        error = %e,
+                        "Batch finalize failed after removal from buffer"
+                    );
+                    return Err(e);
+                }
+            }
+        } else {
+            drop(guard);
+        }
 
         Ok((completed, metadata))
     }
 
+    /// Drain batches that exceed any threshold (rows, bytes, or age).
+    /// Collects expired entries under the lock, then finalizes outside it
+    /// to avoid blocking ingest() during finalization.
     pub fn drain_expired(&self) -> Result<Vec<CompletedBatch>> {
-        let mut guard = self.inner.lock();
-        let mut completed = Vec::new();
-        let keys: Vec<BatchKey> = guard
-            .batches
-            .iter()
-            .filter(|(_, batch)| batch.should_flush(&self.config))
-            .map(|(key, _)| key.clone())
-            .collect();
+        let expired = {
+            let mut guard = self.inner.lock();
+            let keys: Vec<BatchKey> = guard
+                .batches
+                .iter()
+                .filter(|(_, batch)| batch.should_flush(&self.config))
+                .map(|(key, _)| key.clone())
+                .collect();
 
-        for key in keys {
-            if let Some(batch) = guard.batches.remove(&key) {
-                guard.total_bytes = guard.total_bytes.saturating_sub(batch.total_bytes());
-                completed.push(batch.finalize()?);
+            let mut expired = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(batch) = guard.batches.remove(&key) {
+                    guard.total_bytes = guard.total_bytes.saturating_sub(batch.total_bytes());
+                    expired.push(batch);
+                }
             }
-        }
+            expired
+        }; // guard dropped here
 
-        Ok(completed)
+        expired
+            .into_iter()
+            .map(|batch| batch.finalize())
+            .collect()
     }
 
     pub fn drain_all(&self) -> Result<Vec<CompletedBatch>> {
@@ -175,6 +204,22 @@ impl BatchManager {
             .into_iter()
             .map(|(_, batch)| batch.finalize())
             .collect()
+    }
+
+    /// Re-insert a completed batch that failed to persist.
+    /// Uses Arrow memory size for byte tracking (not wire-format estimate).
+    pub fn re_insert(&self, completed: CompletedBatch) {
+        let CompletedBatch { batches, metadata } = completed;
+        let key = BatchKey::from_metadata(&metadata);
+        let byte_estimate: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+
+        let mut guard = self.inner.lock();
+        let buffered = guard
+            .batches
+            .entry(key)
+            .or_insert_with(|| BufferedBatch::new(&metadata));
+        buffered.add_batches(batches, &metadata, byte_estimate);
+        guard.total_bytes += byte_estimate;
     }
 }
 
@@ -219,6 +264,16 @@ mod tests {
         }
     }
 
+    fn create_test_batch_with_ts(
+        service_name: &str,
+        record_count: usize,
+        min_ts_micros: i64,
+    ) -> PartitionedBatch {
+        let mut pb = create_test_batch(service_name, record_count);
+        pb.min_timestamp_micros = min_ts_micros;
+        pb
+    }
+
     #[test]
     fn test_batch_manager_accumulation() {
         let config = BatchConfig {
@@ -228,38 +283,228 @@ mod tests {
         };
         let manager = BatchManager::new(config);
 
-        // First request - should not flush
         let request1 = create_test_batch("test-service", 10);
-        let approx1 = 320; // Approximate bytes
-        let (completed1, _meta1) = manager.ingest(&request1, approx1).unwrap();
-        assert_eq!(completed1.len(), 0); // Not flushed yet
+        let (completed1, _) = manager.ingest(&request1, 320).unwrap();
+        assert_eq!(completed1.len(), 0);
 
-        // Second request - should not flush (total 20 rows)
         let request2 = create_test_batch("test-service", 10);
-        let approx2 = 320;
-        let (completed2, _meta2) = manager.ingest(&request2, approx2).unwrap();
-        assert_eq!(completed2.len(), 0); // Still not flushed
+        let (completed2, _) = manager.ingest(&request2, 320).unwrap();
+        assert_eq!(completed2.len(), 0);
+    }
 
-        // Third test with smaller limit - should flush when hitting threshold
-        let config_small = BatchConfig {
+    #[test]
+    fn test_batch_manager_flush_at_row_threshold() {
+        let config = BatchConfig {
             max_rows: 20,
             max_bytes: 1024 * 1024,
             max_age: Duration::from_secs(10),
         };
-        let manager_small = BatchManager::new(config_small);
+        let manager = BatchManager::new(config);
 
         let req1 = create_test_batch("test-service", 10);
-        let approx_small_1 = 320;
-        let (c1, _) = manager_small.ingest(&req1, approx_small_1).unwrap();
-        assert_eq!(c1.len(), 0); // 10 rows < 20, no flush
+        let (c1, _) = manager.ingest(&req1, 320).unwrap();
+        assert_eq!(c1.len(), 0);
 
         let req2 = create_test_batch("test-service", 10);
-        let approx_small_2 = 320;
-        let (c2, _) = manager_small.ingest(&req2, approx_small_2).unwrap();
-        assert_eq!(c2.len(), 1); // 10 + 10 = 20 rows, should flush!
+        let (c2, _) = manager.ingest(&req2, 320).unwrap();
+        assert_eq!(c2.len(), 1);
         assert_eq!(
             c2[0].batches.iter().map(|b| b.num_rows()).sum::<usize>(),
             20
         );
+    }
+
+    #[test]
+    fn test_batch_manager_flush_at_byte_threshold() {
+        let config = BatchConfig {
+            max_rows: 1_000_000,
+            max_bytes: 500, // Low byte threshold
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+
+        let req1 = create_test_batch("test-service", 5);
+        let (c1, _) = manager.ingest(&req1, 300).unwrap();
+        assert_eq!(c1.len(), 0);
+
+        // Second ingest pushes total bytes over 500
+        let req2 = create_test_batch("test-service", 5);
+        let (c2, _) = manager.ingest(&req2, 300).unwrap();
+        assert_eq!(c2.len(), 1, "Should flush when byte threshold exceeded");
+    }
+
+    #[test]
+    fn test_backpressure_rejects_when_limit_exceeded() {
+        // max_bytes=10_000 → flush threshold, but backpressure at 80_000
+        // We'll accumulate across many services to avoid per-key flush
+        let config = BatchConfig {
+            max_rows: 1_000_000,
+            max_bytes: 10_000,
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+
+        // Accumulate 8 batches across different services (below per-key byte threshold)
+        // Total: 8 * 9_000 = 72_000 < 80_000 backpressure limit
+        for i in 0..8 {
+            let req = create_test_batch(&format!("svc-{}", i), 5);
+            manager.ingest(&req, 9_000).unwrap();
+        }
+
+        // This should be rejected (72_000 + 9_000 = 81_000 > 80_000)
+        let req_over = create_test_batch("svc-overflow", 5);
+        let result = manager.ingest(&req_over, 9_000);
+        assert!(result.is_err(), "Should reject when backpressure limit hit");
+        assert!(
+            result.unwrap_err().to_string().contains("backpressure"),
+            "Error should mention backpressure"
+        );
+    }
+
+    #[test]
+    fn test_drain_all_returns_all_buffered_batches() {
+        let config = BatchConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+
+        let req1 = create_test_batch("svc-a", 5);
+        let req2 = create_test_batch("svc-b", 10);
+        manager.ingest(&req1, 100).unwrap();
+        manager.ingest(&req2, 200).unwrap();
+
+        let drained = manager.drain_all().unwrap();
+        assert_eq!(drained.len(), 2, "Should drain both service batches");
+
+        let total_rows: usize = drained.iter().map(|c| c.metadata.record_count).sum();
+        assert_eq!(total_rows, 15);
+
+        // Manager should be empty after drain
+        let second_drain = manager.drain_all().unwrap();
+        assert!(second_drain.is_empty(), "Second drain should return nothing");
+    }
+
+    #[test]
+    fn test_drain_expired_returns_aged_batches() {
+        let config = BatchConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_millis(1), // Expire almost immediately
+        };
+        let manager = BatchManager::new(config);
+
+        let req = create_test_batch("test-service", 5);
+        manager.ingest(&req, 100).unwrap();
+
+        // Wait for expiry
+        std::thread::sleep(Duration::from_millis(5));
+
+        let expired = manager.drain_expired().unwrap();
+        assert_eq!(expired.len(), 1, "Should drain the expired batch");
+        assert_eq!(expired[0].metadata.record_count, 5);
+    }
+
+    #[test]
+    fn test_drain_expired_leaves_fresh_batches() {
+        let config = BatchConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600), // Very long expiry
+        };
+        let manager = BatchManager::new(config);
+
+        let req = create_test_batch("test-service", 5);
+        manager.ingest(&req, 100).unwrap();
+
+        let expired = manager.drain_expired().unwrap();
+        assert!(expired.is_empty(), "Fresh batch should not be expired");
+
+        // Batch should still be in the manager
+        let all = manager.drain_all().unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_multi_service_batches_isolated() {
+        let config = BatchConfig {
+            max_rows: 10,
+            max_bytes: 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+
+        // 5 rows for svc-a → not flushed
+        let req_a = create_test_batch("svc-a", 5);
+        let (c1, _) = manager.ingest(&req_a, 100).unwrap();
+        assert_eq!(c1.len(), 0);
+
+        // 5 rows for svc-b → not flushed (different key)
+        let req_b = create_test_batch("svc-b", 5);
+        let (c2, _) = manager.ingest(&req_b, 100).unwrap();
+        assert_eq!(c2.len(), 0);
+
+        // 5 more rows for svc-a → flushes svc-a only (total 10)
+        let req_a2 = create_test_batch("svc-a", 5);
+        let (c3, _) = manager.ingest(&req_a2, 100).unwrap();
+        assert_eq!(c3.len(), 1, "svc-a should flush at 10 rows");
+        assert_eq!(*c3[0].metadata.service_name, *"svc-a");
+
+        // svc-b should still be buffered
+        let remaining = manager.drain_all().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(*remaining[0].metadata.service_name, *"svc-b");
+    }
+
+    #[test]
+    fn test_minute_bucket_partitioning() {
+        let config = BatchConfig {
+            max_rows: 10,
+            max_bytes: 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+
+        // Minute 1: timestamp 60_000_000 micros (1 minute)
+        let req1 = create_test_batch_with_ts("svc", 5, 60_000_000);
+        manager.ingest(&req1, 100).unwrap();
+
+        // Minute 2: timestamp 120_000_000 micros (2 minutes) → different bucket
+        let req2 = create_test_batch_with_ts("svc", 5, 120_000_000);
+        manager.ingest(&req2, 100).unwrap();
+
+        // Should have 2 separate batches (different minute buckets)
+        let all = manager.drain_all().unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "Different minute buckets should produce separate batches"
+        );
+    }
+
+    #[test]
+    fn test_re_insert_returns_batch_to_manager() {
+        let config = BatchConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+
+        let req = create_test_batch("test-service", 5);
+        manager.ingest(&req, 100).unwrap();
+
+        // Drain, then re-insert
+        let drained = manager.drain_all().unwrap();
+        assert_eq!(drained.len(), 1);
+
+        let completed = drained.into_iter().next().unwrap();
+        manager.re_insert(completed);
+
+        // Should be back in the manager
+        let re_drained = manager.drain_all().unwrap();
+        assert_eq!(re_drained.len(), 1);
+        assert_eq!(re_drained[0].metadata.record_count, 5);
     }
 }

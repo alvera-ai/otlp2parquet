@@ -179,7 +179,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
         (None, None)
     } else {
         info!(
-            "Batching enabled (max_rows={} max_bytes={} max_age={}s)",
+            "Batching enabled for logs and traces (max_rows={} max_bytes={} max_age={}s)",
             batch_config.max_rows,
             batch_config.max_bytes,
             batch_config.max_age.as_secs()
@@ -277,8 +277,10 @@ async fn flush_pending_batches(state: &AppState) -> Result<()> {
         (Err(e), Ok(())) => Err(e),
         (Ok(()), Err(e)) => Err(e),
         (Err(logs_err), Err(traces_err)) => {
-            error!(error = %traces_err, "Traces flush also failed during shutdown");
-            Err(logs_err.context("logs flush failed; traces flush also failed (see logs above)"))
+            Err(logs_err.context(format!(
+                "logs flush failed; traces flush also failed: {}",
+                traces_err
+            )))
         }
     }
 }
@@ -309,43 +311,13 @@ async fn flush_signal_batches(
         "Flushing buffered batches before shutdown"
     );
 
-    let batch_count = pending.len();
-    let mut failures = 0usize;
-    for completed in pending {
-        let rows = completed.metadata.record_count;
-        let service = completed.metadata.service_name.as_ref().to_string();
-        match handlers::persist_batch(&completed, signal_type, severity_enabled).await {
-            Ok(paths) => {
-                for path in paths {
-                    info!(
-                        path = %path,
-                        signal = signal_type.as_str(),
-                        service_name = %service,
-                        rows,
-                        "Flushed pending batch"
-                    );
-                }
-            }
-            Err(e) => {
-                failures += 1;
-                counter!("otlp.batch.data_loss", "signal" => signal_type.as_str())
-                    .increment(rows as u64);
-                error!(
-                    error = %e,
-                    signal = signal_type.as_str(),
-                    service_name = %service,
-                    rows,
-                    "Failed to flush pending batch during shutdown — data lost"
-                );
-            }
-        }
-    }
+    let (_, failures) =
+        persist_completed_batches(pending, signal_type, severity_enabled, None).await;
 
     if failures > 0 {
         return Err(anyhow::anyhow!(
-            "{} of {} {} batches failed to flush during shutdown",
+            "{} {} batches failed to flush during shutdown — data lost",
             failures,
-            batch_count,
             signal_type.as_str()
         ));
     }
@@ -402,46 +374,85 @@ async fn drain_expired_signal(
         )
     })?;
 
-    let mut failures = 0usize;
-    for completed in expired {
-        let rows = completed.metadata.record_count;
-        let service = completed.metadata.service_name.as_ref().to_string();
-        match handlers::persist_batch(&completed, signal_type, severity_enabled).await {
-            Ok(paths) => {
-                for path in &paths {
-                    info!(
-                        path = %path,
-                        signal = signal_type.as_str(),
-                        service_name = %service,
-                        rows,
-                        "Flushed expired batch"
-                    );
-                }
-            }
-            Err(e) => {
-                failures += 1;
-                counter!("otlp.batch.data_loss", "signal" => signal_type.as_str())
-                    .increment(rows as u64);
-                error!(
-                    error = %e,
-                    signal = signal_type.as_str(),
-                    service_name = %service,
-                    rows,
-                    "Failed to flush expired batch — data lost"
-                );
-            }
-        }
+    if expired.is_empty() {
+        return Ok(());
     }
+
+    // Re-queue failed batches instead of losing them
+    let (_, failures) =
+        persist_completed_batches(expired, signal_type, severity_enabled, Some(batcher)).await;
 
     if failures > 0 {
         anyhow::bail!(
-            "{} expired {} batches failed to persist — data lost",
+            "{} expired {} batches failed to persist — re-queued for retry",
             failures,
             signal_type.as_str()
         );
     }
 
     Ok(())
+}
+
+/// Persist a list of completed batches, logging success/failure for each.
+///
+/// When `re_queue_to` is Some, failed batches are re-inserted into the batcher
+/// for retry on the next cycle (used by background flush). When None, failed
+/// batches are counted as data loss (used by shutdown flush).
+///
+/// Returns (persisted_count, failure_count).
+async fn persist_completed_batches(
+    batches: Vec<batch::CompletedBatch>,
+    signal_type: SignalType,
+    severity_enabled: bool,
+    re_queue_to: Option<&BatchManager>,
+) -> (usize, usize) {
+    let signal_str = signal_type.as_str();
+    let mut persisted = 0usize;
+    let mut failures = 0usize;
+
+    for completed in batches {
+        let rows = completed.metadata.record_count;
+        let service = completed.metadata.service_name.as_ref().to_string();
+        match handlers::persist_batch(&completed, signal_type, severity_enabled).await {
+            Ok(paths) => {
+                persisted += 1;
+                for path in &paths {
+                    info!(
+                        path = %path,
+                        signal = signal_str,
+                        service_name = %service,
+                        rows,
+                        "Flushed batch"
+                    );
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if let Some(batcher) = re_queue_to {
+                    batcher.re_insert(completed);
+                    error!(
+                        error = %e,
+                        signal = signal_str,
+                        service_name = %service,
+                        rows,
+                        "Persist failed — batch re-queued for retry"
+                    );
+                } else {
+                    counter!("otlp.batch.data_loss", "signal" => signal_str)
+                        .increment(rows as u64);
+                    error!(
+                        error = %e,
+                        signal = signal_str,
+                        service_name = %service,
+                        rows,
+                        "Failed to persist batch — data lost"
+                    );
+                }
+            }
+        }
+    }
+
+    (persisted, failures)
 }
 
 #[cfg(test)]
@@ -541,7 +552,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("logs") && err_msg.contains("also failed"),
+            err_msg.contains("logs") && err_msg.contains("traces"),
             "Dual-failure error should mention both signals, got: {}",
             err_msg
         );
@@ -584,7 +595,7 @@ mod tests {
         let msg = err.to_string();
 
         assert!(msg.contains("logs"), "got: {}", msg);
-        assert!(msg.contains("1 of 1"), "got: {}", msg);
+        assert!(msg.contains("1 "), "got: {}", msg);
     }
 
     #[tokio::test]
@@ -665,8 +676,8 @@ mod tests {
         let msg = err.to_string();
 
         assert!(
-            !msg.contains("also failed"),
-            "Single-signal failure should not say 'also failed', got: {}",
+            !msg.contains("traces"),
+            "Single-signal failure should not mention 'traces', got: {}",
             msg
         );
     }
