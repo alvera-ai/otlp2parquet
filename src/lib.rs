@@ -35,13 +35,14 @@ mod batch;
 pub mod codec;
 
 use batch::{BatchConfig as BatcherConfig, BatchManager};
+use metrics::counter;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tower_http::decompression::RequestDecompressionLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 mod handlers;
 mod init;
@@ -57,6 +58,7 @@ use init::init_writer;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub batcher: Option<Arc<BatchManager>>,
+    pub trace_batcher: Option<Arc<BatchManager>>,
     pub max_payload_bytes: usize,
     pub partition_logs_by_severity: bool,
 }
@@ -172,17 +174,20 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
         max_age: Duration::from_secs(config.batch.max_age_secs),
     };
 
-    let batcher = if !config.batch.enabled {
+    let (batcher, trace_batcher) = if !config.batch.enabled {
         info!("Batching disabled by configuration");
-        None
+        (None, None)
     } else {
         info!(
-            "Batching enabled (max_rows={} max_bytes={} max_age={}s)",
+            "Batching enabled for logs and traces (max_rows={} max_bytes={} max_age={}s)",
             batch_config.max_rows,
             batch_config.max_bytes,
             batch_config.max_age.as_secs()
         );
-        Some(Arc::new(BatchManager::new(batch_config)))
+        (
+            Some(Arc::new(BatchManager::new(batch_config.clone()))),
+            Some(Arc::new(BatchManager::new(batch_config))),
+        )
     };
 
     let max_payload_bytes = config.request.max_payload_bytes;
@@ -191,6 +196,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     // Create app state
     let state = AppState {
         batcher,
+        trace_batcher,
         max_payload_bytes,
         partition_logs_by_severity: config.storage.partition_logs_by_severity,
     };
@@ -211,7 +217,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     // Create TCP listener
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .context(format!("Failed to bind to {}", addr))?;
+        .with_context(|| format!("Failed to bind to {}", addr))?;
 
     info!("OTLP HTTP endpoint listening on http://{}", addr);
     info!("Routes:");
@@ -224,7 +230,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
 
     // Spawn background flush task if batching is enabled
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let flush_handle = if state.batcher.is_some() {
+    let flush_handle = if state.batcher.is_some() || state.trace_batcher.is_some() {
         let flush_state = state.clone();
         let flush_shutdown = Arc::clone(&shutdown_flag);
         let flush_interval =
@@ -245,7 +251,9 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     // Signal background task to stop and wait for it
     shutdown_flag.store(true, Ordering::SeqCst);
     if let Some(handle) = flush_handle {
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            error!(error = ?e, "Background flush task panicked during shutdown");
+        }
     }
 
     flush_pending_batches(&state).await?;
@@ -256,44 +264,62 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
 }
 
 async fn flush_pending_batches(state: &AppState) -> Result<()> {
-    if let Some(batcher) = &state.batcher {
-        let pending = batcher
-            .drain_all()
-            .context("Failed to drain pending log batches during shutdown")?;
-
-        if pending.is_empty() {
-            return Ok(());
+    let logs_result = flush_signal_batches(
+        &state.batcher,
+        SignalType::Logs,
+        state.partition_logs_by_severity,
+    )
+    .await;
+    let traces_result =
+        flush_signal_batches(&state.trace_batcher, SignalType::Traces, false).await;
+    match (logs_result, traces_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(()), Err(e)) => Err(e),
+        (Err(logs_err), Err(traces_err)) => {
+            Err(logs_err.context(format!(
+                "logs flush failed; traces flush also failed: {}",
+                traces_err
+            )))
         }
+    }
+}
 
-        info!(
-            batch_count = pending.len(),
-            "Flushing buffered log batches before shutdown"
-        );
+async fn flush_signal_batches(
+    batcher: &Option<Arc<BatchManager>>,
+    signal_type: SignalType,
+    severity_enabled: bool,
+) -> Result<()> {
+    let Some(batcher) = batcher else {
+        return Ok(());
+    };
 
-        for completed in pending {
-            let rows = completed.metadata.record_count;
-            let service = completed.metadata.service_name.as_ref().to_string();
-            match handlers::persist_log_batch(&completed, state.partition_logs_by_severity).await {
-                Ok(paths) => {
-                    for path in paths {
-                        info!(
-                            path = %path,
-                            service_name = %service,
-                            rows,
-                            "Flushed pending batch"
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        service_name = %service,
-                        rows,
-                        "Failed to flush pending batch during shutdown — data lost"
-                    );
-                }
-            }
-        }
+    let pending = batcher.drain_all().with_context(|| {
+        format!(
+            "Failed to drain pending {} batches during shutdown",
+            signal_type.as_str()
+        )
+    })?;
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        signal = signal_type.as_str(),
+        batch_count = pending.len(),
+        "Flushing buffered batches before shutdown"
+    );
+
+    let (_, failures) =
+        persist_completed_batches(pending, signal_type, severity_enabled, None).await;
+
+    if failures > 0 {
+        return Err(anyhow::anyhow!(
+            "{} {} batches failed to flush during shutdown — data lost",
+            failures,
+            signal_type.as_str()
+        ));
     }
 
     Ok(())
@@ -313,45 +339,346 @@ async fn run_background_flush(state: AppState, shutdown: Arc<AtomicBool>, interv
             break;
         }
 
-        if let Some(batcher) = &state.batcher {
-            match batcher.drain_expired() {
-                Ok(expired) => {
-                    for completed in expired {
-                        let rows = completed.metadata.record_count;
-                        let service = completed.metadata.service_name.as_ref().to_string();
-                        match handlers::persist_log_batch(
-                            &completed,
-                            state.partition_logs_by_severity,
-                        )
-                        .await
-                        {
-                            Ok(paths) => {
-                                for path in &paths {
-                                    info!(
-                                        path = %path,
-                                        service_name = %service,
-                                        rows,
-                                        "Flushed expired batch"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    service_name = %service,
-                                    rows,
-                                    "Failed to flush expired batch — data lost"
-                                );
-                            }
-                        }
-                    }
+        if let Err(e) = drain_expired_signal(
+            &state.batcher,
+            SignalType::Logs,
+            state.partition_logs_by_severity,
+        )
+        .await
+        {
+            error!(error = %e, "Background log flush cycle failed");
+        }
+        if let Err(e) =
+            drain_expired_signal(&state.trace_batcher, SignalType::Traces, false).await
+        {
+            error!(error = %e, "Background trace flush cycle failed");
+        }
+    }
+
+    debug!("Background flush task stopped");
+}
+
+async fn drain_expired_signal(
+    batcher: &Option<Arc<BatchManager>>,
+    signal_type: SignalType,
+    severity_enabled: bool,
+) -> Result<()> {
+    let Some(batcher) = batcher else {
+        return Ok(());
+    };
+
+    let expired = batcher.drain_expired().with_context(|| {
+        format!(
+            "Failed to drain expired {} batches",
+            signal_type.as_str()
+        )
+    })?;
+
+    if expired.is_empty() {
+        return Ok(());
+    }
+
+    // Re-queue failed batches instead of losing them
+    let (_, failures) =
+        persist_completed_batches(expired, signal_type, severity_enabled, Some(batcher)).await;
+
+    if failures > 0 {
+        anyhow::bail!(
+            "{} expired {} batches failed to persist — re-queued for retry",
+            failures,
+            signal_type.as_str()
+        );
+    }
+
+    Ok(())
+}
+
+/// Persist a list of completed batches, logging success/failure for each.
+///
+/// When `re_queue_to` is Some, failed batches are re-inserted into the batcher
+/// for retry on the next cycle (used by background flush). When None, failed
+/// batches are counted as data loss (used by shutdown flush).
+///
+/// Returns (persisted_count, failure_count).
+async fn persist_completed_batches(
+    batches: Vec<batch::CompletedBatch>,
+    signal_type: SignalType,
+    severity_enabled: bool,
+    re_queue_to: Option<&BatchManager>,
+) -> (usize, usize) {
+    let signal_str = signal_type.as_str();
+    let mut persisted = 0usize;
+    let mut failures = 0usize;
+
+    for completed in batches {
+        let rows = completed.metadata.record_count;
+        let service = completed.metadata.service_name.as_ref().to_string();
+        match handlers::persist_batch(&completed, signal_type, severity_enabled).await {
+            Ok(paths) => {
+                persisted += 1;
+                for path in &paths {
+                    info!(
+                        path = %path,
+                        signal = signal_str,
+                        service_name = %service,
+                        rows,
+                        "Flushed batch"
+                    );
                 }
-                Err(e) => {
-                    warn!(error = %e, "Failed to drain expired batches");
+            }
+            Err(e) => {
+                failures += 1;
+                if let Some(batcher) = re_queue_to {
+                    batcher.re_insert(completed);
+                    error!(
+                        error = %e,
+                        signal = signal_str,
+                        service_name = %service,
+                        rows,
+                        "Persist failed — batch re-queued for retry"
+                    );
+                } else {
+                    counter!("otlp.batch.data_loss", "signal" => signal_str)
+                        .increment(rows as u64);
+                    error!(
+                        error = %e,
+                        signal = signal_str,
+                        service_name = %service,
+                        rows,
+                        "Failed to persist batch — data lost"
+                    );
                 }
             }
         }
     }
 
-    debug!("Background flush task stopped");
+    (persisted, failures)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::batch::{BatchConfig as BatcherConfig, BatchManager};
+
+    fn make_test_batch(rows: usize) -> otlp2records::PartitionedBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("severity_text", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let sevs: Vec<Option<&str>> = vec![Some("INFO"); rows];
+        let bodies: Vec<Option<&str>> = vec![Some("msg"); rows];
+        let sev = StringArray::from(sevs);
+        let body = StringArray::from(bodies);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(sev) as ArrayRef, Arc::new(body) as ArrayRef],
+        )
+        .unwrap();
+        otlp2records::PartitionedBatch {
+            batch,
+            service_name: Arc::from("test-service"),
+            min_timestamp_micros: 1_700_000_000_000_000,
+            record_count: rows,
+        }
+    }
+
+    fn make_batcher_with_data(rows: usize) -> BatchManager {
+        let config = BatcherConfig {
+            max_rows: 1_000_000, // High threshold so nothing auto-flushes
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let manager = BatchManager::new(config);
+        let pb = make_test_batch(rows);
+        let (_completed, _meta) = manager.ingest(&pb, 100).unwrap();
+        manager
+    }
+
+    #[tokio::test]
+    async fn flush_signal_batches_returns_err_when_persist_fails() {
+        let batcher = make_batcher_with_data(5);
+        let batcher_opt = Some(Arc::new(batcher));
+
+        let result = flush_signal_batches(&batcher_opt, SignalType::Logs, false).await;
+        assert!(
+            result.is_err(),
+            "flush_signal_batches should return Err when persist_batch fails, but got Ok(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_signal_batches_returns_err_when_trace_persist_fails() {
+        let batcher = make_batcher_with_data(10);
+        let batcher_opt = Some(Arc::new(batcher));
+
+        let result = flush_signal_batches(&batcher_opt, SignalType::Traces, false).await;
+        assert!(
+            result.is_err(),
+            "flush_signal_batches should return Err when trace persist fails, but got Ok(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_pending_batches_attempts_both_signals_when_first_fails() {
+        let log_batcher = make_batcher_with_data(5);
+        let trace_batcher = make_batcher_with_data(10);
+
+        let state = AppState {
+            batcher: Some(Arc::new(log_batcher)),
+            trace_batcher: Some(Arc::new(trace_batcher)),
+            max_payload_bytes: 1024 * 1024,
+            partition_logs_by_severity: false,
+        };
+
+        let result = flush_pending_batches(&state).await;
+        assert!(
+            result.is_err(),
+            "flush_pending_batches should return Err when persists fail"
+        );
+
+        // Both batchers must have been drained
+        let trace_remaining = state.trace_batcher.as_ref().unwrap().drain_all().unwrap();
+        assert!(
+            trace_remaining.is_empty(),
+            "trace batcher should be empty (drained) even though logs flush failed first, \
+             but {} batches remain",
+            trace_remaining.len()
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("logs") && err_msg.contains("traces"),
+            "Dual-failure error should mention both signals, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_signal_batches_returns_ok_when_batcher_is_none() {
+        flush_signal_batches(&None, SignalType::Logs, false)
+            .await
+            .expect("flush_signal_batches with None logs batcher should return Ok");
+
+        flush_signal_batches(&None, SignalType::Traces, false)
+            .await
+            .expect("flush_signal_batches with None traces batcher should return Ok");
+    }
+
+    #[tokio::test]
+    async fn flush_signal_batches_empty_batcher_returns_ok() {
+        let config = BatcherConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let empty_batcher = BatchManager::new(config);
+        let batcher_opt = Some(Arc::new(empty_batcher));
+
+        flush_signal_batches(&batcher_opt, SignalType::Logs, false)
+            .await
+            .expect("should return Ok when batcher exists but has no pending data");
+    }
+
+    #[tokio::test]
+    async fn flush_signal_batches_error_contains_count_and_signal() {
+        let batcher = make_batcher_with_data(5);
+        let batcher_opt = Some(Arc::new(batcher));
+
+        let err = flush_signal_batches(&batcher_opt, SignalType::Logs, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("logs"), "got: {}", msg);
+        assert!(msg.contains("1 "), "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_batches_only_logs_batcher() {
+        let log_batcher = make_batcher_with_data(5);
+
+        let state = AppState {
+            batcher: Some(Arc::new(log_batcher)),
+            trace_batcher: None,
+            max_payload_bytes: 1024 * 1024,
+            partition_logs_by_severity: false,
+        };
+
+        let result = flush_pending_batches(&state).await;
+        assert!(result.is_err(), "Should return Err from logs flush failure");
+    }
+
+    #[tokio::test]
+    async fn flush_pending_batches_only_trace_batcher() {
+        let trace_batcher = make_batcher_with_data(10);
+
+        let state = AppState {
+            batcher: None,
+            trace_batcher: Some(Arc::new(trace_batcher)),
+            max_payload_bytes: 1024 * 1024,
+            partition_logs_by_severity: false,
+        };
+
+        let result = flush_pending_batches(&state).await;
+        assert!(
+            result.is_err(),
+            "Should return Err from traces flush failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_pending_batches_logs_ok_traces_err() {
+        let config = BatcherConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let empty_log_batcher = BatchManager::new(config);
+        let trace_batcher = make_batcher_with_data(3);
+
+        let state = AppState {
+            batcher: Some(Arc::new(empty_log_batcher)),
+            trace_batcher: Some(Arc::new(trace_batcher)),
+            max_payload_bytes: 1024 * 1024,
+            partition_logs_by_severity: false,
+        };
+
+        let result = flush_pending_batches(&state).await;
+        assert!(
+            result.is_err(),
+            "Should return Err when traces flush fails even if logs flush succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_pending_batches_single_failure_no_also_failed() {
+        let log_batcher = make_batcher_with_data(5);
+        let config = BatcherConfig {
+            max_rows: 1_000_000,
+            max_bytes: 100 * 1024 * 1024,
+            max_age: Duration::from_secs(3600),
+        };
+        let empty_trace_batcher = BatchManager::new(config);
+
+        let state = AppState {
+            batcher: Some(Arc::new(log_batcher)),
+            trace_batcher: Some(Arc::new(empty_trace_batcher)),
+            max_payload_bytes: 1024 * 1024,
+            partition_logs_by_severity: false,
+        };
+
+        let err = flush_pending_batches(&state).await.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            !msg.contains("traces"),
+            "Single-signal failure should not mention 'traces', got: {}",
+            msg
+        );
+    }
 }
