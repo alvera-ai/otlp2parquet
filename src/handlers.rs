@@ -99,8 +99,8 @@ async fn process_logs(
 ) -> Result<Response, AppError> {
     let start = Instant::now();
     let body_len = body.len();
-    counter!("otlp.ingest.requests").increment(1);
-    histogram!("otlp.ingest.bytes").record(body_len as f64);
+    counter!("otlp.ingest.requests", "signal" => "logs").increment(1);
+    histogram!("otlp.ingest.bytes", "signal" => "logs").record(body_len as f64);
 
     let parse_start = Instant::now();
     let grouped = decode_logs_partitioned(&body, format).map_err(|e| {
@@ -145,7 +145,7 @@ async fn process_logs_batched(
         }
 
         total_records += pb.record_count;
-        counter!("otlp.ingest.records").increment(pb.record_count as u64);
+        counter!("otlp.ingest.records", "signal" => "logs").increment(pb.record_count as u64);
 
         // Ingest into batcher - may return completed batches if thresholds hit
         let (completed, _metadata) = batcher
@@ -188,7 +188,8 @@ async fn process_logs_batched(
         "batch_ingest"
     );
 
-    histogram!("otlp.ingest.latency_ms").record(start.elapsed().as_secs_f64() * 1000.0);
+    histogram!("otlp.ingest.latency_ms", "signal" => "logs")
+        .record(start.elapsed().as_secs_f64() * 1000.0);
 
     let response = Json(json!({
         "status": "ok",
@@ -224,7 +225,8 @@ async fn process_logs_direct(
         "write"
     );
 
-    histogram!("otlp.ingest.latency_ms").record(start.elapsed().as_secs_f64() * 1000.0);
+    histogram!("otlp.ingest.latency_ms", "signal" => "logs")
+        .record(start.elapsed().as_secs_f64() * 1000.0);
 
     let response = Json(json!({
         "status": "ok",
@@ -365,6 +367,10 @@ async fn process_traces_direct(
         "write"
     );
 
+    // Record latency even for empty payloads (heartbeats)
+    histogram!("otlp.ingest.latency_ms", "signal" => "traces")
+        .record(start.elapsed().as_secs_f64() * 1000.0);
+
     if spans_processed == 0 {
         return Ok((
             StatusCode::OK,
@@ -375,9 +381,6 @@ async fn process_traces_direct(
         )
             .into_response());
     }
-
-    histogram!("otlp.ingest.latency_ms", "signal" => "traces")
-        .record(start.elapsed().as_secs_f64() * 1000.0);
 
     let response = Json(json!({
         "status": "ok",
@@ -529,12 +532,12 @@ pub(crate) async fn persist_batch(
         Some(batch) => batch,
         None => {
             if completed.metadata.record_count > 0 {
-                tracing::error!(
-                    signal = signal_type.as_str(),
-                    service = %completed.metadata.service_name,
-                    expected_rows = completed.metadata.record_count,
-                    "CompletedBatch metadata reports rows but all batches are empty — data loss"
-                );
+                return Err(anyhow::anyhow!(
+                    "Data loss detected: {} batch for service '{}' reports {} rows but all batches are empty",
+                    signal_type.as_str(),
+                    completed.metadata.service_name,
+                    completed.metadata.record_count
+                ));
             }
             return Ok(Vec::new());
         }
@@ -550,12 +553,8 @@ pub(crate) async fn persist_batch(
     )
     .await?;
 
-    let counter_name = match signal_type {
-        SignalType::Logs => "otlp.batch.flushes",
-        SignalType::Traces => "otlp.traces.batch.flushes",
-        SignalType::Metrics => "otlp.metrics.batch.flushes",
-    };
-    counter!(counter_name).increment(written.len() as u64);
+    counter!("otlp.batch.flushes", "signal" => signal_type.as_str())
+        .increment(written.len() as u64);
 
     Ok(written)
 }
@@ -647,13 +646,16 @@ async fn write_grouped_batches(
         // Record ingestion counters + histogram at the original batch level (pre-split)
         match mode {
             BatchWriteMode::Logs => {
-                counter!("otlp.ingest.records").increment(pb.record_count as u64);
-                histogram!("otlp.batch.rows").record(pb.record_count as f64);
+                counter!("otlp.ingest.records", "signal" => "logs")
+                    .increment(pb.record_count as u64);
+                histogram!("otlp.batch.rows", "signal" => "logs")
+                    .record(pb.record_count as f64);
             }
             BatchWriteMode::Traces => {
                 counter!("otlp.ingest.records", "signal" => "traces")
                     .increment(pb.record_count as u64);
-                histogram!("otlp.batch.rows", "signal" => "traces").record(pb.record_count as f64);
+                histogram!("otlp.batch.rows", "signal" => "traces")
+                    .record(pb.record_count as f64);
             }
             BatchWriteMode::Metrics { .. } => {}
         }
@@ -674,18 +676,19 @@ async fn write_grouped_batches(
         for path in &written {
             match mode {
                 BatchWriteMode::Logs => {
-                    counter!("otlp.batch.flushes").increment(1);
+                    counter!("otlp.flushes", "signal" => "logs").increment(1);
                     info!("Committed batch path={} service={}", path, pb.service_name);
                 }
                 BatchWriteMode::Traces => {
-                    counter!("otlp.traces.flushes").increment(1);
+                    counter!("otlp.flushes", "signal" => "traces").increment(1);
                     info!(
                         "Committed traces batch path={} service={}",
                         path, pb.service_name
                     );
                 }
                 BatchWriteMode::Metrics { metric_type } => {
-                    counter!("otlp.metrics.flushes", "metric_type" => metric_type).increment(1);
+                    counter!("otlp.flushes", "signal" => "metrics", "metric_type" => metric_type)
+                        .increment(1);
                     info!(
                         "Committed metrics batch path={} service={}",
                         path, pb.service_name
@@ -801,5 +804,256 @@ mod tests {
 
         let result = merge_record_batches(&[b1, b2]);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Finding 3: persist_batch must return Err on metadata/data mismatch
+    // =========================================================================
+
+    /// When metadata reports rows but all batches are empty, persist_batch
+    /// should return Err (data loss detected), not Ok(vec![]).
+    /// This is a critical data-loss bug: the caller receives success and
+    /// acknowledges the data to the client, but nothing was persisted.
+    #[tokio::test]
+    async fn persist_batch_returns_err_when_metadata_reports_rows_but_batches_empty() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![empty_batch(), empty_batch()],
+            metadata: SignalMetadata {
+                service_name: Arc::from("test-service"),
+                first_timestamp_micros: 1_700_000_000_000_000,
+                record_count: 42,
+            },
+        };
+
+        let result = persist_batch(&completed, SignalType::Logs, false).await;
+
+        // DESIRED: Err because metadata says 42 rows but all batches are empty
+        assert!(
+            result.is_err(),
+            "persist_batch should return Err when metadata reports rows but batches are empty, got Ok({:?})",
+            result.unwrap()
+        );
+    }
+
+    /// When metadata reports rows but the batch vec is completely empty,
+    /// persist_batch should also return Err.
+    #[tokio::test]
+    async fn persist_batch_returns_err_when_metadata_reports_rows_but_no_batches() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![],
+            metadata: SignalMetadata {
+                service_name: Arc::from("trace-service"),
+                first_timestamp_micros: 1_700_000_000_000_000,
+                record_count: 10,
+            },
+        };
+
+        let result = persist_batch(&completed, SignalType::Traces, false).await;
+
+        assert!(
+            result.is_err(),
+            "persist_batch should return Err when metadata reports rows but batch vec is empty, got Ok({:?})",
+            result.unwrap()
+        );
+    }
+
+    // =========================================================================
+    // T1: persist_batch with record_count=0 + empty batches → Ok
+    // =========================================================================
+
+    /// When metadata reports 0 rows and all batches are empty, persist_batch
+    /// should return Ok(vec![]) — nothing to persist, no error.
+    #[tokio::test]
+    async fn persist_batch_returns_ok_when_record_count_zero_and_batches_empty() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![empty_batch(), empty_batch()],
+            metadata: SignalMetadata {
+                service_name: Arc::from("test-service"),
+                first_timestamp_micros: 1_700_000_000_000_000,
+                record_count: 0,
+            },
+        };
+
+        let result = persist_batch(&completed, SignalType::Logs, false).await;
+
+        let paths = result.expect(
+            "persist_batch should return Ok when record_count is 0 and batches are empty",
+        );
+        assert!(
+            paths.is_empty(),
+            "persist_batch should return empty paths when nothing to persist"
+        );
+    }
+
+    // =========================================================================
+    // Regression tests
+    // =========================================================================
+
+    /// Regression: persist_batch error message must include signal type, service
+    /// name, and row count so operators can diagnose data-loss events from logs.
+    /// A future refactor might accidentally strip this context.
+    #[tokio::test]
+    async fn regression_persist_batch_error_message_contains_diagnostic_context() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![empty_batch()],
+            metadata: SignalMetadata {
+                service_name: Arc::from("payment-api"),
+                first_timestamp_micros: 1_700_000_000_000_000,
+                record_count: 99,
+            },
+        };
+
+        let err = persist_batch(&completed, SignalType::Logs, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("logs"),
+            "Error should contain signal type 'logs', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("payment-api"),
+            "Error should contain service name 'payment-api', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("99"),
+            "Error should contain row count '99', got: {}",
+            msg
+        );
+    }
+
+    /// Regression: persist_batch error message for traces signal must say
+    /// "traces" not "logs". Verifies signal_type.as_str() is used correctly.
+    #[tokio::test]
+    async fn regression_persist_batch_error_message_uses_correct_signal_type() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![],
+            metadata: SignalMetadata {
+                service_name: Arc::from("order-service"),
+                first_timestamp_micros: 1_700_000_000_000_000,
+                record_count: 7,
+            },
+        };
+
+        let err = persist_batch(&completed, SignalType::Traces, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("traces"),
+            "Error for traces signal should contain 'traces', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("order-service"),
+            "Error should contain service name 'order-service', got: {}",
+            msg
+        );
+    }
+
+    /// Regression: a single empty batch must return None from merge, just like
+    /// multiple empty batches or an empty slice. This is a boundary condition
+    /// the existing tests cover for 0 and 2 empty batches, but not exactly 1.
+    #[test]
+    fn regression_merge_single_empty_batch_returns_none() {
+        let result = merge_record_batches(&[empty_batch()]).unwrap();
+        assert!(
+            result.is_none(),
+            "A single empty batch should merge to None"
+        );
+    }
+
+    /// Regression: merged output must preserve the schema of the input batches
+    /// (field names, types, nullability). A future concat implementation change
+    /// could silently alter schema metadata.
+    #[test]
+    fn regression_merge_preserves_schema_fields() {
+        let b1 = make_batch(&["INFO"]);
+        let b2 = make_batch(&["ERROR"]);
+
+        let merged = merge_record_batches(&[b1.clone(), b2]).unwrap().unwrap();
+
+        assert_eq!(
+            merged.schema(),
+            b1.schema(),
+            "Merged batch schema must match input batch schema"
+        );
+    }
+
+    /// Regression: persist_batch with record_count=0 and zero-length batch vec
+    /// should return Ok (not Err). This is the true "nothing happened" boundary:
+    /// no batches, no claimed rows.
+    #[tokio::test]
+    async fn regression_persist_batch_zero_count_zero_batches_is_ok() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![],
+            metadata: SignalMetadata {
+                service_name: Arc::from("empty-service"),
+                first_timestamp_micros: 0,
+                record_count: 0,
+            },
+        };
+
+        let result = persist_batch(&completed, SignalType::Traces, false).await;
+        let paths = result.expect(
+            "persist_batch should return Ok when record_count=0 and batches vec is empty",
+        );
+        assert!(paths.is_empty());
+    }
+
+    /// Regression: merge_record_batches with a large number of batches should
+    /// produce a single batch with the sum of all rows. Prevents off-by-one
+    /// in concat logic when many small batches are merged.
+    #[test]
+    fn regression_merge_many_small_batches() {
+        let batches: Vec<RecordBatch> = (0..50).map(|_| make_batch(&["INFO"])).collect();
+
+        let merged = merge_record_batches(&batches).unwrap().unwrap();
+        assert_eq!(
+            merged.num_rows(),
+            50,
+            "Merging 50 single-row batches should produce 50 rows"
+        );
+    }
+
+    /// Regression: data loss error message must contain "Data loss detected"
+    /// so that log monitoring can alert on this specific failure mode.
+    #[tokio::test]
+    async fn regression_persist_batch_data_loss_message_is_alertable() {
+        use crate::batch::{CompletedBatch, SignalMetadata};
+
+        let completed = CompletedBatch {
+            batches: vec![empty_batch()],
+            metadata: SignalMetadata {
+                service_name: Arc::from("svc"),
+                first_timestamp_micros: 1_000_000,
+                record_count: 1,
+            },
+        };
+
+        let err = persist_batch(&completed, SignalType::Logs, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Data loss detected"),
+            "Error message must contain 'Data loss detected' for monitoring alerts, got: {}",
+            err
+        );
     }
 }
