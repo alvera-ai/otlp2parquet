@@ -50,9 +50,9 @@ pub struct BatchConfig {
     pub max_age: Duration,
 }
 
-/// Metadata extracted during OTLP parsing for log batches.
+/// Metadata extracted during OTLP parsing, shared across all signal types.
 #[derive(Debug, Clone)]
-pub struct LogMetadata {
+pub struct SignalMetadata {
     pub service_name: Arc<str>,
     // Stored in microseconds to align with Parquet expectations.
     pub first_timestamp_micros: i64,
@@ -68,7 +68,7 @@ pub trait BatchMetadata: Clone {
     fn aggregate(service_name: Arc<str>, first_timestamp_micros: i64, record_count: usize) -> Self;
 }
 
-impl BatchMetadata for LogMetadata {
+impl BatchMetadata for SignalMetadata {
     fn service_name(&self) -> &Arc<str> {
         &self.service_name
     }
@@ -104,13 +104,14 @@ pub trait SignalProcessor {
 
 type BatchIngestResult<M> = Result<(Vec<CompletedBatch<M>>, M)>;
 
-/// Log-specific signal processor using Arrow-native PartitionedBatch.
+/// Default signal processor using Arrow-native PartitionedBatch.
+/// Works for any signal type (logs, traces) that decodes into PartitionedBatch.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct LogSignalProcessor;
+pub struct DefaultSignalProcessor;
 
-impl SignalProcessor for LogSignalProcessor {
+impl SignalProcessor for DefaultSignalProcessor {
     type Request = PartitionedBatch;
-    type Metadata = LogMetadata;
+    type Metadata = SignalMetadata;
 
     fn estimate_row_count(request: &Self::Request) -> usize {
         request.record_count
@@ -120,7 +121,7 @@ impl SignalProcessor for LogSignalProcessor {
         request: &Self::Request,
         _capacity_hint: usize,
     ) -> Result<(Vec<RecordBatch>, Self::Metadata)> {
-        let metadata = LogMetadata {
+        let metadata = SignalMetadata {
             service_name: Arc::clone(&request.service_name),
             first_timestamp_micros: request.min_timestamp_micros,
             record_count: request.record_count,
@@ -134,13 +135,13 @@ impl SignalProcessor for LogSignalProcessor {
 /// Contains merged Arrow RecordBatch + metadata.
 /// Hashing and serialization happen in the storage layer.
 #[derive(Debug)]
-pub struct CompletedBatch<M: BatchMetadata = LogMetadata> {
+pub struct CompletedBatch<M: BatchMetadata = SignalMetadata> {
     pub batches: Vec<RecordBatch>,
     pub metadata: M,
 }
 
 /// Thread-safe batch orchestrator shared across handlers.
-pub struct BatchManager<P: SignalProcessor = LogSignalProcessor> {
+pub struct BatchManager<P: SignalProcessor = DefaultSignalProcessor> {
     config: BatchConfig,
     inner: Arc<Mutex<BatchState<P>>>,
     _marker: PhantomData<P>,
@@ -302,7 +303,7 @@ mod tests {
             max_bytes: 1024 * 1024,
             max_age: Duration::from_secs(10),
         };
-        let manager = BatchManager::<LogSignalProcessor>::new(config);
+        let manager = BatchManager::<DefaultSignalProcessor>::new(config);
 
         // First request - should not flush
         let request1 = create_test_batch("test-service", 10);
@@ -322,7 +323,7 @@ mod tests {
             max_bytes: 1024 * 1024,
             max_age: Duration::from_secs(10),
         };
-        let manager_small = BatchManager::<LogSignalProcessor>::new(config_small);
+        let manager_small = BatchManager::<DefaultSignalProcessor>::new(config_small);
 
         let req1 = create_test_batch("test-service", 10);
         let approx_small_1 = 320;

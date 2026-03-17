@@ -87,7 +87,7 @@ async fn handle_signal(
 
     match signal {
         SignalType::Logs => process_logs(state, format, body).await,
-        SignalType::Traces => process_traces(format, body).await,
+        SignalType::Traces => process_traces(state, format, body).await,
         SignalType::Metrics => process_metrics(format, body).await,
     }
 }
@@ -163,7 +163,7 @@ async fn process_logs_batched(
         } else {
             // Thresholds hit - flush completed batches
             for batch in completed {
-                let paths = persist_log_batch(&batch, severity_enabled)
+                let paths = persist_batch(&batch, SignalType::Logs, severity_enabled)
                     .await
                     .map_err(|e| {
                         AppError::internal(anyhow::anyhow!("Failed to flush batch: {}", e))
@@ -238,12 +238,14 @@ async fn process_logs_direct(
 }
 
 async fn process_traces(
+    state: &AppState,
     format: InputFormat,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
+    let body_len = body.len();
     counter!("otlp.ingest.requests", "signal" => "traces").increment(1);
-    histogram!("otlp.ingest.bytes", "signal" => "traces").record(body.len() as f64);
+    histogram!("otlp.ingest.bytes", "signal" => "traces").record(body_len as f64);
 
     let parse_start = Instant::now();
     let grouped = decode_traces_partitioned(&body, format).map_err(|e| {
@@ -259,6 +261,94 @@ async fn process_traces(
         "parse"
     );
 
+    if let Some(ref batcher) = state.trace_batcher {
+        process_traces_batched(batcher, grouped, body_len, start).await
+    } else {
+        process_traces_direct(grouped, start).await
+    }
+}
+
+/// Process traces with batching - accumulate in memory, flush when thresholds hit
+async fn process_traces_batched(
+    batcher: &crate::batch::BatchManager,
+    grouped: ServiceGroupedBatches,
+    body_len: usize,
+    start: Instant,
+) -> Result<Response, AppError> {
+    let mut total_records: usize = 0;
+    let mut buffered_records: usize = 0;
+    let mut flushed_paths = Vec::new();
+
+    let batch_count = grouped.batches.len().max(1);
+    let approx_bytes_per_batch = body_len / batch_count;
+
+    let write_start = Instant::now();
+    for pb in grouped.batches {
+        if pb.batch.num_rows() == 0 {
+            continue;
+        }
+
+        total_records += pb.record_count;
+        counter!("otlp.ingest.records", "signal" => "traces").increment(pb.record_count as u64);
+
+        let (completed, _metadata) = batcher
+            .ingest(&pb, approx_bytes_per_batch)
+            .map_err(|e| AppError::internal(anyhow::anyhow!("Batch ingestion failed: {}", e)))?;
+
+        if completed.is_empty() {
+            buffered_records += pb.record_count;
+            debug!(
+                service = %pb.service_name,
+                records = pb.record_count,
+                "Buffered traces"
+            );
+        } else {
+            for batch in completed {
+                let paths = persist_batch(&batch, SignalType::Traces, false)
+                    .await
+                    .map_err(|e| {
+                        AppError::internal(anyhow::anyhow!("Failed to flush trace batch: {}", e))
+                    })?;
+
+                for path in &paths {
+                    info!(
+                        path = %path,
+                        service = %batch.metadata.service_name,
+                        rows = batch.metadata.record_count,
+                        "Flushed trace batch (threshold)"
+                    );
+                }
+                flushed_paths.extend(paths);
+            }
+        }
+    }
+
+    debug!(
+        elapsed_us = write_start.elapsed().as_micros() as u64,
+        signal = "traces",
+        "batch_ingest"
+    );
+
+    histogram!("otlp.ingest.latency_ms", "signal" => "traces")
+        .record(start.elapsed().as_secs_f64() * 1000.0);
+
+    let response = Json(json!({
+        "status": "ok",
+        "mode": "batched",
+        "spans_processed": total_records,
+        "spans_buffered": buffered_records,
+        "flush_count": flushed_paths.len(),
+        "partitions": flushed_paths,
+    }));
+
+    Ok((StatusCode::OK, response).into_response())
+}
+
+/// Process traces directly - write each batch immediately (no batching)
+async fn process_traces_direct(
+    grouped: ServiceGroupedBatches,
+    start: Instant,
+) -> Result<Response, AppError> {
     let write_start = Instant::now();
     let (uploaded_paths, spans_processed) = write_grouped_batches(
         grouped,
@@ -291,6 +381,7 @@ async fn process_traces(
 
     let response = Json(json!({
         "status": "ok",
+        "mode": "direct",
         "spans_processed": spans_processed,
         "partitions": uploaded_paths,
     }));
@@ -427,8 +518,9 @@ async fn write_metric_batches(
 /// Persist a completed batch from the BatchManager to storage.
 /// Merges all accumulated RecordBatches into one before writing, so a single
 /// flush produces K files (one per severity) instead of N×K.
-pub(crate) async fn persist_log_batch(
+pub(crate) async fn persist_batch(
     completed: &CompletedBatch,
+    signal_type: SignalType,
     severity_enabled: bool,
 ) -> Result<Vec<String>, anyhow::Error> {
     let merged = merge_record_batches(&completed.batches)?;
@@ -438,6 +530,7 @@ pub(crate) async fn persist_log_batch(
         None => {
             if completed.metadata.record_count > 0 {
                 tracing::error!(
+                    signal = signal_type.as_str(),
                     service = %completed.metadata.service_name,
                     expected_rows = completed.metadata.record_count,
                     "CompletedBatch metadata reports rows but all batches are empty — data loss"
@@ -449,7 +542,7 @@ pub(crate) async fn persist_log_batch(
 
     let written = write_batch_with_severity(
         &merged,
-        SignalType::Logs,
+        signal_type,
         None,
         &completed.metadata.service_name,
         completed.metadata.first_timestamp_micros,
@@ -457,7 +550,12 @@ pub(crate) async fn persist_log_batch(
     )
     .await?;
 
-    counter!("otlp.batch.flushes").increment(written.len() as u64);
+    let counter_name = match signal_type {
+        SignalType::Logs => "otlp.batch.flushes",
+        SignalType::Traces => "otlp.traces.batch.flushes",
+        SignalType::Metrics => "otlp.metrics.batch.flushes",
+    };
+    counter!(counter_name).increment(written.len() as u64);
 
     Ok(written)
 }

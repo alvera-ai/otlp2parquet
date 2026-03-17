@@ -57,6 +57,7 @@ use init::init_writer;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub batcher: Option<Arc<BatchManager>>,
+    pub trace_batcher: Option<Arc<BatchManager>>,
     pub max_payload_bytes: usize,
     pub partition_logs_by_severity: bool,
 }
@@ -172,9 +173,9 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
         max_age: Duration::from_secs(config.batch.max_age_secs),
     };
 
-    let batcher = if !config.batch.enabled {
+    let (batcher, trace_batcher) = if !config.batch.enabled {
         info!("Batching disabled by configuration");
-        None
+        (None, None)
     } else {
         info!(
             "Batching enabled (max_rows={} max_bytes={} max_age={}s)",
@@ -182,7 +183,15 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
             batch_config.max_bytes,
             batch_config.max_age.as_secs()
         );
-        Some(Arc::new(BatchManager::new(batch_config)))
+        let trace_config = BatcherConfig {
+            max_rows: batch_config.max_rows,
+            max_bytes: batch_config.max_bytes,
+            max_age: batch_config.max_age,
+        };
+        (
+            Some(Arc::new(BatchManager::new(batch_config))),
+            Some(Arc::new(BatchManager::new(trace_config))),
+        )
     };
 
     let max_payload_bytes = config.request.max_payload_bytes;
@@ -191,6 +200,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     // Create app state
     let state = AppState {
         batcher,
+        trace_batcher,
         max_payload_bytes,
         partition_logs_by_severity: config.storage.partition_logs_by_severity,
     };
@@ -224,7 +234,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
 
     // Spawn background flush task if batching is enabled
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let flush_handle = if state.batcher.is_some() {
+    let flush_handle = if state.batcher.is_some() || state.trace_batcher.is_some() {
         let flush_state = state.clone();
         let flush_shutdown = Arc::clone(&shutdown_flag);
         let flush_interval =
@@ -256,42 +266,63 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
 }
 
 async fn flush_pending_batches(state: &AppState) -> Result<()> {
-    if let Some(batcher) = &state.batcher {
-        let pending = batcher
-            .drain_all()
-            .context("Failed to drain pending log batches during shutdown")?;
+    flush_signal_batches(
+        &state.batcher,
+        SignalType::Logs,
+        state.partition_logs_by_severity,
+    )
+    .await?;
+    flush_signal_batches(&state.trace_batcher, SignalType::Traces, false).await?;
+    Ok(())
+}
 
-        if pending.is_empty() {
-            return Ok(());
-        }
+async fn flush_signal_batches(
+    batcher: &Option<Arc<BatchManager>>,
+    signal_type: SignalType,
+    severity_enabled: bool,
+) -> Result<()> {
+    let Some(batcher) = batcher else {
+        return Ok(());
+    };
 
-        info!(
-            batch_count = pending.len(),
-            "Flushing buffered log batches before shutdown"
-        );
+    let pending = batcher.drain_all().context(format!(
+        "Failed to drain pending {} batches during shutdown",
+        signal_type.as_str()
+    ))?;
 
-        for completed in pending {
-            let rows = completed.metadata.record_count;
-            let service = completed.metadata.service_name.as_ref().to_string();
-            match handlers::persist_log_batch(&completed, state.partition_logs_by_severity).await {
-                Ok(paths) => {
-                    for path in paths {
-                        info!(
-                            path = %path,
-                            service_name = %service,
-                            rows,
-                            "Flushed pending batch"
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        signal = signal_type.as_str(),
+        batch_count = pending.len(),
+        "Flushing buffered batches before shutdown"
+    );
+
+    for completed in pending {
+        let rows = completed.metadata.record_count;
+        let service = completed.metadata.service_name.as_ref().to_string();
+        match handlers::persist_batch(&completed, signal_type, severity_enabled).await {
+            Ok(paths) => {
+                for path in paths {
+                    info!(
+                        path = %path,
+                        signal = signal_type.as_str(),
                         service_name = %service,
                         rows,
-                        "Failed to flush pending batch during shutdown — data lost"
+                        "Flushed pending batch"
                     );
                 }
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    signal = signal_type.as_str(),
+                    service_name = %service,
+                    rows,
+                    "Failed to flush pending batch during shutdown — data lost"
+                );
             }
         }
     }
@@ -313,45 +344,62 @@ async fn run_background_flush(state: AppState, shutdown: Arc<AtomicBool>, interv
             break;
         }
 
-        if let Some(batcher) = &state.batcher {
-            match batcher.drain_expired() {
-                Ok(expired) => {
-                    for completed in expired {
-                        let rows = completed.metadata.record_count;
-                        let service = completed.metadata.service_name.as_ref().to_string();
-                        match handlers::persist_log_batch(
-                            &completed,
-                            state.partition_logs_by_severity,
-                        )
-                        .await
-                        {
-                            Ok(paths) => {
-                                for path in &paths {
-                                    info!(
-                                        path = %path,
-                                        service_name = %service,
-                                        rows,
-                                        "Flushed expired batch"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    service_name = %service,
-                                    rows,
-                                    "Failed to flush expired batch — data lost"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to drain expired batches");
-                }
-            }
-        }
+        drain_expired_signal(
+            &state.batcher,
+            SignalType::Logs,
+            state.partition_logs_by_severity,
+        )
+        .await;
+        drain_expired_signal(&state.trace_batcher, SignalType::Traces, false).await;
     }
 
     debug!("Background flush task stopped");
+}
+
+async fn drain_expired_signal(
+    batcher: &Option<Arc<BatchManager>>,
+    signal_type: SignalType,
+    severity_enabled: bool,
+) {
+    let Some(batcher) = batcher else {
+        return;
+    };
+
+    match batcher.drain_expired() {
+        Ok(expired) => {
+            for completed in expired {
+                let rows = completed.metadata.record_count;
+                let service = completed.metadata.service_name.as_ref().to_string();
+                match handlers::persist_batch(&completed, signal_type, severity_enabled).await {
+                    Ok(paths) => {
+                        for path in &paths {
+                            info!(
+                                path = %path,
+                                signal = signal_type.as_str(),
+                                service_name = %service,
+                                rows,
+                                "Flushed expired batch"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            signal = signal_type.as_str(),
+                            service_name = %service,
+                            rows,
+                            "Failed to flush expired batch — data lost"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                signal = signal_type.as_str(),
+                "Failed to drain expired batches"
+            );
+        }
+    }
 }
